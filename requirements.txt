@@ -1,0 +1,10 @@
+# 界面
+PyQt5>=5.15
+
+# Claude Agent SDK（也可以放在 vendor/ 目录里，程序会优先加载 vendor）
+claude-agent-sdk==0.2.176
+
+# 图片文字识别（离线 OCR）
+rapidocr-onnxruntime>=1.3
+numpy
+opencv-python

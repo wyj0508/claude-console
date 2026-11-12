@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Claude 控制台
+Name[en]=Claude Console
+Comment=启动、恢复和管理 Claude Code 会话
+Exec=/home/wyj/桌面/claude-console/run.sh
+Icon=/home/wyj/桌面/claude-console/icon.png
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
+StartupWMClass=Claude Console

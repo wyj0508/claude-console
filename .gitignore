@@ -1,0 +1,25 @@
+# 第三方依赖（体积大，用 requirements.txt 安装）
+vendor/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 备份文件
+*.bak
+*.bak.*
+
+# 运行期数据
+.claude-console/
+generated/
+*.log
+
+# 本地凭据/配置（不应入库）
+.agents/
+.aws/
+.codex/
+.env
+.env.*
+*.pem
