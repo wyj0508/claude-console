@@ -128,10 +128,17 @@ cp claude-console.desktop ~/.local/share/applications/
 
 ## 依赖
 
-- `python3-pyqt5`（本机已安装）
-- `vendor/` 目录内的 `claude-agent-sdk`（已随项目安装，请勿删除）
-- 图片文字识别：`rapidocr-onnxruntime`（已安装到用户目录；模型随包离线携带）
-- `numpy` / `opencv`（本机已有 `python3-opencv`）
+安装 Python 依赖：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+- `PyQt5`
+- `claude-agent-sdk`：程序会优先加载 `vendor/` 目录里的版本；没有 `vendor/`
+  时使用 pip 安装的版本
+- 图片文字识别：`rapidocr-onnxruntime`（模型随包离线携带）
+- `numpy` / `opencv-python`
 - Claude Code CLI（本机通过 nvm 安装；程序会自动在 `~/.nvm/versions/node/*/bin`
   等常见位置查找，即使从桌面启动时 PATH 不完整也能工作）
 
