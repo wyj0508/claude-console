@@ -689,7 +689,7 @@ class DualUIAcceptance(DualUIFixture):
 
 
 class ChatScrollPositioning(DualUIFixture):
-    """切换项目后的定位：使用真实 singleShot，不依赖被 mock 的定时器。"""
+    """切换项目后定位到对话最底部：使用真实 singleShot，不依赖被 mock 的定时器。"""
 
     LONG = '\n'.join(
         f'第{i}行 内容内容内容内容内容内容内容内容内容内容' for i in range(100))
@@ -721,7 +721,7 @@ class ChatScrollPositioning(DualUIFixture):
         y = target.mapTo(w.chat_body_widget, m.QPoint(0, 0)).y()
         return w.chat_scroll.verticalScrollBar(), target, y
 
-    def test_switch_lands_on_latest_user_question_start(self):
+    def test_switch_lands_at_conversation_bottom(self):
         w = self.window
         w.show()
         self._timer_patch.stop()
@@ -734,14 +734,13 @@ class ChatScrollPositioning(DualUIFixture):
                     w._chat_state(path)['blocks'] = self._blocks()
                     w._reset_chat_for_project()
                     self._settle()
-                    bar, target, y = self._target_geometry()
+                    bar, target, _y = self._target_geometry()
                     bubble = target.findChild(m.ChatBubble)
                     self.assertEqual(bubble.role, 'user')
                     self.assertEqual(bubble.raw_text, '最新一轮问题：起始位置')
-                    self.assertGreater(y, 0)
-                    self.assertEqual(bar.value(), min(y, bar.maximum()))
-                    # 定位在最近用户提问的开头，而不是停在最底部。
-                    self.assertLess(bar.value(), bar.maximum())
+                    # 切换项目后直接显示对话最底部。
+                    self.assertGreater(bar.maximum(), 0)
+                    self.assertEqual(bar.value(), bar.maximum())
                     # 正常聊天仍自动滚到底。
                     w._add_bubble('assistant', self.LONG)
                     self._settle()
@@ -756,7 +755,7 @@ class ChatScrollPositioning(DualUIFixture):
         w.show()
         self._timer_patch.stop()
         try:
-            # 只有 AI 消息：没有用户提问时退回最后一条消息。
+            # 只有 AI 消息：同样直接定位到最底部。
             path = tempfile.mkdtemp()
             w.current_project = path
             w._chat_state(path)['blocks'] = [
@@ -768,9 +767,8 @@ class ChatScrollPositioning(DualUIFixture):
             self._settle()
             bar = w.chat_scroll.verticalScrollBar()
             self.assertIsNone(w._chat_last_user_wrapper)
-            target = w._chat_last_wrapper
-            y = target.mapTo(w.chat_body_widget, m.QPoint(0, 0)).y()
-            self.assertEqual(bar.value(), min(y, bar.maximum()))
+            self.assertGreater(bar.maximum(), 0)
+            self.assertEqual(bar.value(), bar.maximum())
             # 空项目：显示空态，不滚动、不报错。
             empty = tempfile.mkdtemp()
             w.current_project = empty
@@ -799,10 +797,10 @@ class ChatScrollPositioning(DualUIFixture):
                 w._on_project_changed(item, None)
             self._settle()
             self.assertEqual(w.current_project, path)
-            bar, target, y = self._target_geometry()
+            bar, target, _y = self._target_geometry()
             self.assertEqual(target.findChild(m.ChatBubble).raw_text,
                              '信号路径最后一问')
-            self.assertEqual(bar.value(), min(y, bar.maximum()))
+            self.assertEqual(bar.value(), bar.maximum())
         finally:
             self._settle()
             self._timer_patch.start()
@@ -821,15 +819,15 @@ class ChatScrollPositioning(DualUIFixture):
             w._chat_state(path)['blocks'] = self._blocks(latest='隐藏页切换后的提问')
             w._reset_chat_for_project()
             self._settle()
-            # 对话页不可见时先暂存，不乱滚。
-            self.assertIsNotNone(w._pending_chat_anchor)
+            # 对话页不可见时先暂存“滚到底部”，不乱滚。
+            self.assertTrue(w._pending_chat_bottom)
             w.tabs.setCurrentWidget(w.chat_tab)
             self._settle()
-            self.assertIsNone(w._pending_chat_anchor)
-            bar, target, y = self._target_geometry()
+            self.assertFalse(w._pending_chat_bottom)
+            bar, target, _y = self._target_geometry()
             self.assertEqual(target.findChild(m.ChatBubble).raw_text,
                              '隐藏页切换后的提问')
-            self.assertEqual(bar.value(), min(y, bar.maximum()))
+            self.assertEqual(bar.value(), bar.maximum())
         finally:
             self._settle()
             self._timer_patch.start()
@@ -852,16 +850,15 @@ class ChatScrollPositioning(DualUIFixture):
             w.current_project = second
             w._reset_chat_for_project()
             self._settle()
-            bar, target, y = self._target_geometry()
+            bar, target, _y = self._target_geometry()
             bubble = target.findChild(m.ChatBubble)
             self.assertEqual(bubble.raw_text, '项目 B 最后一问')
             self.assertEqual(w.current_project, second)
-            self.assertEqual(bar.value(), min(y, bar.maximum()))
-            before = bar.value()
-            # 后台项目输出不改变当前项目的定位。
+            self.assertEqual(bar.value(), bar.maximum())
+            # 后台项目输出不改变当前项目的定位：仍停在当前项目底部。
             w._on_dual_note(w._chat_state(first), '项目 A 后台输出')
             self._settle()
-            self.assertEqual(bar.value(), before)
+            self.assertEqual(bar.value(), bar.maximum())
             self.assertEqual(w.current_project, second)
         finally:
             self._settle()

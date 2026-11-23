@@ -7650,15 +7650,16 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._chat_empty = None
         # 切换项目后的定位：渲染代次隔离过期滚动回调；批量重建期间
-        # 抑制逐项滚到底，等布局稳定后把最近一轮用户提问顶到视口顶部。
+        # 抑制逐项滚动，等布局稳定后直接滚到对话最底部。
         self._chat_render_gen = 0
         self._chat_bulk_render = False
         self._chat_last_wrapper = None
         self._chat_last_user_wrapper = None
-        # 显式滚到底的序号：用于判断切换定位是否已被新的聊天滚动取代。
+        # 显式滚到底的序号：用于判断滚动意图是否已被新的聊天滚动取代。
         self._chat_scroll_seq = 0
         # 对话页不在前台时暂存定位，切回对话页再应用。
         self._pending_chat_anchor = None
+        self._pending_chat_bottom = False
         self._plugin_worker = None
         self._skill_worker = None
         self._plugins_loaded = False
@@ -8487,6 +8488,7 @@ class MainWindow(QMainWindow):
         if widget is getattr(self, "chat_tab", None):
             # 切回对话页时补上切换项目时因页面隐藏而暂存的定位。
             QTimer.singleShot(0, self._apply_pending_chat_anchor)
+            QTimer.singleShot(0, self._apply_pending_chat_bottom)
         if widget is self.assets_tab:
             self._refresh_skills()
             if not self._plugins_loaded:
@@ -10492,6 +10494,7 @@ class MainWindow(QMainWindow):
         self._chat_last_wrapper = None
         self._chat_last_user_wrapper = None
         self._pending_chat_anchor = None
+        self._pending_chat_bottom = False
         self._stream_timer.stop()
         while self.chat_layout.count() > 1:
             item = self.chat_layout.takeAt(0)
@@ -10565,9 +10568,7 @@ class MainWindow(QMainWindow):
         """按当前项目的记录重建对话区（切换项目或恢复时使用）。"""
         state = self._chat_state()
         self._clear_chat_view()
-        gen = self._chat_render_gen
-        project = self.current_project or ""
-        # 批量重建期间不逐条滚到底，否则最后一帧会停在最下面。
+        # 批量重建期间不逐条滚到底，等全部气泡插入后一次定位。
         self._chat_bulk_render = True
         self._chat_last_wrapper = None
         self._chat_last_user_wrapper = None
@@ -10586,11 +10587,13 @@ class MainWindow(QMainWindow):
                 state["dual_live_bubble"] = bubble
         finally:
             self._chat_bulk_render = False
-        target = self._chat_last_user_wrapper or self._chat_last_wrapper
-        if target is not None:
-            # 定位到最近一轮用户提问的顶部；没有用户消息时退回最后一条消息。
-            self._scroll_to_wrapper_top(
-                target, gen, project, self._chat_scroll_seq)
+        # 切换项目后直接定位到对话最底部，显示最新的消息。
+        if state["blocks"] or state["live"] or state.get("dual_live"):
+            if self.chat_scroll.isVisible():
+                self._scroll_to_bottom(settle=True)
+            else:
+                # 对话页不在前台：切回对话页时再滚到底。
+                self._pending_chat_bottom = True
         if not state["blocks"] and not state["live"]:
             if state["path"]:
                 self._show_empty_state("开始新的对话吧\n在下方输入消息")
@@ -10642,29 +10645,44 @@ class MainWindow(QMainWindow):
         self._append_chat_block(
             {"kind": "tool", "name": name, "data": data})
 
-    def _scroll_to_bottom(self):
+    def _scroll_to_bottom(self, settle=False):
         if self._chat_bulk_render:
             return
         self._chat_scroll_seq += 1
         bar = self.chat_scroll.verticalScrollBar()
         gen = self._chat_render_gen
-        QTimer.singleShot(0, lambda: self._apply_scroll_bottom(bar, gen, final=False))
+        QTimer.singleShot(
+            0, lambda: self._apply_scroll_bottom(bar, gen, final=False,
+                                                 settle=settle))
 
-    def _apply_scroll_bottom(self, bar, gen, final=True):
+    def _apply_scroll_bottom(self, bar, gen, final=True, settle=False):
         # 渲染代次已变（切换项目 / 重建）时丢弃过期回调。
         if gen != self._chat_render_gen:
             return
+        if settle:
+            # 切换项目后刚插入的气泡要先完成布局，
+            # 滚动条最大值才是真实内容高度。
+            self.chat_layout.activate()
+            self.chat_body_widget.adjustSize()
         bar.setValue(bar.maximum())
         if not final:
             # 新内容插入后布局可能再长一帧；延后校准到真正的底部。
             QTimer.singleShot(
-                0, lambda: self._apply_scroll_bottom(bar, gen, final=True))
+                0, lambda: self._apply_scroll_bottom(
+                    bar, gen, final=True, settle=settle))
 
     def _scroll_to_wrapper_top(self, wrapper, gen, project, seq):
         """把某个气泡（最近一轮用户提问）定位到聊天视口顶部。"""
         QTimer.singleShot(
             0, lambda: self._apply_wrapper_top(
                 wrapper, gen, project, seq, final=False))
+
+    def _apply_pending_chat_bottom(self):
+        """切回对话页后补上切换项目时暂存的“滚到底部”。"""
+        if not self._pending_chat_bottom:
+            return
+        self._pending_chat_bottom = False
+        self._scroll_to_bottom(settle=True)
 
     def _apply_pending_chat_anchor(self):
         """切回对话页后应用此前暂存的定位。"""
