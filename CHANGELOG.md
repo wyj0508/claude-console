@@ -1,5 +1,41 @@
 # 更新日志
 
+## 2.0.1 — 2026-11-24
+
+Windows 适配。修复在 Windows 上点击「打开文件夹」「VS Code」等按钮导致
+整个程序闪退的问题。
+
+### 修复
+
+- **按钮闪退**：槽函数里未处理的异常会让 PyQt5 直接 `abort` 进程。现在接管
+  `sys.excepthook`，异常只弹提示并写入终端，程序继续运行。
+- **打开文件夹 / 文件管理器**：`xdg-open` 换成平台实现（Windows 用
+  `os.startfile`，macOS 用 `open`，Linux 仍用 `xdg-open`）。
+- **VS Code**：npm 安装的 `code.cmd` 不再直接 `Popen`（Windows 无法执行批处理），
+  统一经 `cmd.exe` 调用。
+- **应用内对话**：Windows 上优先使用 `claude.exe`（原生安装或
+  `claude-agent-sdk` 自带），避开 SDK 对 `claude.cmd` 的拒绝执行；找不到
+  原生程序时再由 SDK 自行解析。
+- **外部终端**：Windows 使用 `cmd /k` 新窗口，macOS 使用 Terminal.app；
+  命令参数按平台规则加引号。
+- **双 AI 协作 / 插件管理**：调用 `claude.cmd`、`codex.cmd` 时统一经
+  `cmd.exe`，取消任务改用 `taskkill /T` 结束整棵进程树。
+- **技能库链接**：Windows 没有符号链接权限时自动退回目录联接（junction），
+  删除链接时不会再误删共享库本体。
+- **媒体生成**：Windows 的 `select()` 不支持管道，改为读取线程 + 队列，
+  流式日志和取消功能保持可用。
+- **配置目录**：Windows 使用 `%APPDATA%\claude-console`（旧的
+  `~/.config/claude-console` 会自动沿用一次），运行记录使用 `%LOCALAPPDATA%`。
+
+### 新增
+
+- `win_compat.py`：跨平台兼容层，供 `main` / `dual_ai` / `agent_shared` 共用。
+- `run.bat` / `run.ps1`：Windows 启动脚本（`--background` 用 `pythonw` 启动）。
+
+### 已知限制
+
+- 后台任务列表与实时网速依赖 Linux 的 `/proc`，Windows 下显示「无 / —」。
+
 ## 2.0 — 2026-11-23
 
 双 AI 协作版本。在 1.0 的单 AI 基础上加入主 AI / 执行 AI 分工，并修复协作

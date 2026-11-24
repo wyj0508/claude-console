@@ -453,7 +453,9 @@ def _pick_log(group: list[dict], now: float) -> str | None:
 # --------------------------------------------------------------------------- #
 # 网络
 # --------------------------------------------------------------------------- #
-def _read_net() -> tuple[int, int]:
+def _read_net():
+    if not os.path.isdir(_PROC):
+        return None
     rx_total = tx_total = 0
     for line in _read_text(f"{_PROC}/net/dev").splitlines():
         if ":" not in line:
@@ -474,7 +476,12 @@ def _read_net() -> tuple[int, int]:
 
 def _network_snapshot(now: float) -> dict:
     global _PREV_NET
-    rx, tx = _read_net()
+    raw = _read_net()
+    if raw is None:
+        # 非 Linux 平台没有 /proc：界面上显示「—」而不是 0 B/s
+        _PREV_NET = None
+        return {"rx_bps": None, "tx_bps": None}
+    rx, tx = raw
     rx_bps = tx_bps = None
     if _PREV_NET is not None:
         prev_ts, prev_rx, prev_tx = _PREV_NET

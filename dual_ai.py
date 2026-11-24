@@ -19,7 +19,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -31,11 +30,26 @@ from pathlib import Path
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
+import win_compat
+
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
 CODEX_MODEL_CACHE = CODEX_HOME / "models_cache.json"
 CODEX_AUTH = CODEX_HOME / "auth.json"
-RUN_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME") or
-                      (Path.home() / ".local/state")) / "claude-console/dual-runs"
+
+
+def _state_home() -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg)
+    if win_compat.IS_WINDOWS:
+        local = os.environ.get("LOCALAPPDATA")
+        return Path(local) if local else Path.home() / "AppData" / "Local"
+    if win_compat.IS_MACOS:
+        return Path.home() / "Library" / "Application Support"
+    return Path.home() / ".local" / "state"
+
+
+RUN_STATE_ROOT = _state_home() / "claude-console/dual-runs"
 
 CODEX_BIN_CANDIDATES = (
     "/usr/lib/chatgpt/resources/codex",
@@ -44,6 +58,9 @@ CODEX_BIN_CANDIDATES = (
     str(Path.home() / ".local/bin/codex"),
     str(Path.home() / ".npm-global/bin/codex"),
 )
+if win_compat.IS_WINDOWS:
+    CODEX_BIN_CANDIDATES += tuple(
+        str(p) for p in win_compat.npm_candidate_paths(("codex.exe", "codex.cmd")))
 
 # 缓存里没有时的兜底；实际优先使用 ~/.codex/models_cache.json
 FALLBACK_CODEX_MODELS = (
@@ -269,6 +286,10 @@ def find_codex_binary():
     found = shutil.which("codex")
     if found:
         return found
+    if win_compat.IS_WINDOWS:
+        exe = shutil.which("codex.exe")
+        if exe:
+            return exe
     for candidate in CODEX_BIN_CANDIDATES:
         path = Path(candidate).expanduser()
         if path.is_file() and os.access(path, os.X_OK):
@@ -567,17 +588,10 @@ class CliAgent:
         if proc is None:
             return
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            win_compat.kill_process_tree(proc, timeout=4)
         except Exception:  # noqa: BLE001
             try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            proc.wait(timeout=4)
-        except Exception:  # noqa: BLE001
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                proc.kill()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -590,7 +604,7 @@ class CliAgent:
                 if bin_dir and bin_dir not in path.split(os.pathsep):
                     path = bin_dir + os.pathsep + path
         env["PATH"] = path
-        proc = subprocess.Popen(
+        proc = win_compat.popen(
             cmd, cwd=self.cwd, env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",

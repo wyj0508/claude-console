@@ -26,6 +26,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import win_compat
+
 HOME = Path.home()
 SHARED_ROOT = HOME / ".agents"
 SHARED_SKILLS = SHARED_ROOT / "skills"
@@ -146,6 +148,38 @@ def _link_ok(target: Path, real: Path) -> bool:
         return False
 
 
+def _is_linkish(path: Path) -> bool:
+    """符号链接或 Windows 目录联接（junction）。"""
+    if path.is_symlink():
+        return True
+    checker = getattr(path, "is_junction", None)
+    try:
+        return bool(checker and checker())
+    except OSError:
+        return False
+
+
+def _create_dir_link(target: Path, real: Path) -> None:
+    """建立目录链接。
+
+    Windows 上创建符号链接需要开发者模式或管理员权限，失败时退回
+    不需要额外权限的目录联接（``mklink /J``，仅限同一卷）。
+    """
+    try:
+        os.symlink(real, target, target_is_directory=True)
+        return
+    except OSError:
+        if not win_compat.IS_WINDOWS:
+            raise
+    proc = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(target), str(real)],
+        capture_output=True, text=True,
+        creationflags=win_compat.windowless_flags())
+    if proc.returncode != 0:
+        raise OSError(
+            (proc.stdout or proc.stderr or "创建目录链接失败").strip())
+
+
 def _ensure_link(target: Path, real: Path, replace: bool = False) -> str:
     """让 target 指向 real；返回 created / kept / replaced / conflict。"""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -154,14 +188,14 @@ def _ensure_link(target: Path, real: Path, replace: bool = False) -> str:
     if os.path.lexists(target):
         if not replace:
             return "conflict"
-        if target.is_dir() and not target.is_symlink():
+        if target.is_dir() and not _is_linkish(target):
             shutil.rmtree(target)
         else:
             target.unlink()
         state = "replaced"
     else:
         state = "created"
-    os.symlink(real, target, target_is_directory=True)
+    _create_dir_link(target, real)
     return state
 
 
@@ -270,7 +304,7 @@ def adopt_existing_skills() -> list[str]:
     SHARED_SKILLS.mkdir(parents=True, exist_ok=True)
     for label, root in SKILL_LINK_TARGETS:
         for entry in _skill_dirs(root):
-            if entry.is_symlink():
+            if _is_linkish(entry):
                 continue
             target = SHARED_SKILLS / entry.name
             if os.path.lexists(target):
@@ -307,11 +341,12 @@ def remove_skill(name: str) -> None:
     for _label, root in SKILL_LINK_TARGETS:
         link = root / name
         if os.path.lexists(link):
-            if link.is_symlink() or link.is_file():
+            # 链接/junction 只删链接本身，绝不能递归删到共享库里的真身
+            if _is_linkish(link) or link.is_file():
                 link.unlink()
             else:
                 shutil.rmtree(link)
-    if target.is_symlink():
+    if _is_linkish(target):
         target.unlink()
     elif target.exists():
         shutil.rmtree(target)
@@ -642,6 +677,7 @@ def all_codex_sessions(limit: int = 200,
 # --------------------------------------------------------------------------- #
 def _candidate_paths():
     yield shutil.which("claude")
+    yield shutil.which("claude.exe")
     for pattern in (".nvm/versions/node/*/bin/claude",
                     ".local/share/fnm/node-versions/*/installation/bin/claude",
                     ".nodenv/versions/*/bin/claude",
@@ -653,6 +689,9 @@ def _candidate_paths():
                   ".bun/bin/claude", "/usr/local/bin/claude",
                   "/usr/bin/claude"):
         yield str(HOME / fixed) if not fixed.startswith("/") else fixed
+    if win_compat.IS_WINDOWS:
+        for path in win_compat.npm_candidate_paths(("claude.exe", "claude.cmd")):
+            yield str(path)
 
 
 def find_claude_cli() -> str | None:
@@ -675,6 +714,9 @@ def find_codex_cli() -> str | None:
         HOME / ".npm-global/bin/codex",
     ]
     candidates.extend(HOME.glob(".nvm/versions/node/*/bin/codex"))
+    if win_compat.IS_WINDOWS:
+        candidates.extend(
+            win_compat.npm_candidate_paths(("codex.exe", "codex.cmd")))
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
@@ -682,7 +724,7 @@ def find_codex_cli() -> str | None:
 
 
 def _run(argv: list[str], timeout: int = 120):
-    proc = subprocess.run(argv, capture_output=True, text=True,
+    proc = win_compat.run(argv, capture_output=True, text=True,
                           timeout=timeout, env=os.environ.copy())
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -698,7 +740,7 @@ def _cli_env() -> dict:
 
 
 def _run_env(argv: list[str], timeout: int = 120):
-    proc = subprocess.run(argv, capture_output=True, text=True,
+    proc = win_compat.run(argv, capture_output=True, text=True,
                           timeout=timeout, env=_cli_env())
     return proc.returncode, proc.stdout, proc.stderr
 

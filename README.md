@@ -273,6 +273,24 @@
 
 ## 运行
 
+### Windows
+
+双击 `run.bat`，或在项目目录执行：
+
+```bat
+.venv\Scripts\python.exe main.py
+```
+
+- 已建好 `.venv` 时 `run.bat` 会自动使用它；也可以加 `--background`
+  参数用 `pythonw` 启动（不弹控制台窗口）。
+- 开始对话时会优先使用 `claude.exe`（原生安装或 `claude-agent-sdk`
+  自带的版本）；没有 `claude.exe` 时，CLI 相关功能通过 `cmd.exe` 调用 npm
+  安装的 `claude.cmd`。
+- 技能库链接优先用符号链接，没有开发者模式时自动退回目录联接（junction）。
+- 后台任务/网速监控依赖 Linux 的 `/proc`，Windows 下显示为「无 / —」。
+
+### Linux
+
 ```bash
 ./run.sh
 ```
@@ -296,8 +314,9 @@ python3 -m pip install -r requirements.txt
   时使用 pip 安装的版本
 - 图片文字识别：`rapidocr-onnxruntime`（模型随包离线携带）
 - `numpy` / `opencv-python`
-- Claude Code CLI（本机通过 nvm 安装；程序会自动在 `~/.nvm/versions/node/*/bin`
-  等常见位置查找，即使从桌面启动时 PATH 不完整也能工作）
+- Claude Code CLI（Linux 上程序会自动在 `~/.nvm/versions/node/*/bin`
+  等常见位置查找，即使从桌面启动时 PATH 不完整也能工作；Windows 上会查找
+  `%APPDATA%\npm` 等目录，并优先使用 `claude.exe`）
 
 ## 说明
 

@@ -7,6 +7,7 @@ import difflib
 import html
 import json
 import os
+import queue
 import re
 import select
 import shlex
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import warnings
 from dataclasses import dataclass
@@ -47,6 +49,7 @@ import agent_shared as shared_agents
 import background_monitor
 import dual_ai
 import image_ocr
+import win_compat
 
 # --------------------------------------------------------------------------- #
 # 常量 & 依赖
@@ -73,7 +76,21 @@ except Exception as _sdk_exc:  # noqa: BLE001 - 缺少依赖时界面给出提�
 
 warnings.filterwarnings("ignore", message="can_use_tool will not be invoked.*")
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "claude-console"
+
+def default_config_home() -> Path:
+    """配置根目录：有 XDG_CONFIG_HOME 时沿用，否则按平台惯例。"""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg)
+    if win_compat.IS_WINDOWS:
+        appdata = os.environ.get("APPDATA")
+        return Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    if win_compat.IS_MACOS:
+        return Path.home() / "Library" / "Application Support"
+    return Path.home() / ".config"
+
+
+CONFIG_DIR = default_config_home() / "claude-console"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STUDY_DIR = CONFIG_DIR / "studies"
 DEV_RECORDS_DIR = CONFIG_DIR / "dev_records"
@@ -257,6 +274,13 @@ CLAUDE_FIXED_PATHS = (
     "/usr/local/bin/claude",
     "/usr/bin/claude",
 )
+if win_compat.IS_WINDOWS:
+    # npm 全局安装：claude.cmd（shim）或原生安装器：claude.exe
+    CLAUDE_FIXED_PATHS += tuple(
+        str(p) for p in win_compat.npm_candidate_paths(("claude.exe", "claude.cmd")))
+    CLAUDE_FIXED_PATHS += (
+        str(Path.home() / ".local" / "bin" / "claude.exe"),
+    )
 
 
 def _version_key(path):
@@ -280,7 +304,7 @@ def find_claude():
             # 优先选版本号最高、其次最新安装的那一个
             found = str(max(matches, key=lambda p: (_version_key(p), p.stat().st_mtime)))
 
-    if not found:
+    if not found and shutil.which("bash"):
         # 最后向登录 shell 询问一次（登录 shell 会加载 nvm 等配置）
         try:
             result = subprocess.run(
@@ -309,6 +333,35 @@ def claude_path_env():
         if bin_dir not in path_env.split(os.pathsep):
             path_env = bin_dir + os.pathsep + path_env
     return path_env
+
+
+def find_native_claude_exe():
+    """返回可直接被 CreateProcess 执行的 claude.exe。
+
+    Windows 上 npm 安装的是 ``claude.cmd`` shim，Claude Agent SDK 会出于
+    命令注入风险拒绝执行它。优先找原生安装的 claude.exe；找不到时退回
+    SDK 自带的 claude.exe（Windows wheel 会打包一个）。
+    """
+    if not win_compat.IS_WINDOWS:
+        return find_claude()
+    found = shutil.which("claude.exe")
+    if found:
+        return found
+    candidates = [Path.home() / ".local" / "bin" / "claude.exe"]
+    candidates.extend(win_compat.npm_candidate_paths(("claude.exe",)))
+    try:
+        import claude_agent_sdk
+        candidates.append(
+            Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude.exe")
+    except Exception:  # noqa: BLE001 - SDK 缺失时继续尝试其他位置
+        pass
+    for path in candidates:
+        try:
+            if path.is_file():
+                return str(path)
+        except OSError:
+            continue
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -470,15 +523,27 @@ def default_projects():
     return projects
 
 
+def legacy_config_path() -> Path | None:
+    """Windows 上旧版本把配置写在 ~/.config 下，升级后沿用一次。"""
+    if not win_compat.IS_WINDOWS:
+        return None
+    return Path.home() / ".config" / "claude-console" / "config.json"
+
+
 def load_config():
-    if not CONFIG_PATH.exists():
-        cfg = dict(DEFAULT_CONFIG)
-        cfg["projects"] = default_projects()
-        return cfg
+    path = CONFIG_PATH
+    if not path.exists():
+        legacy = legacy_config_path()
+        if legacy is not None and legacy.is_file():
+            path = legacy
+        else:
+            cfg = dict(DEFAULT_CONFIG)
+            cfg["projects"] = default_projects()
+            return cfg
     cfg = dict(DEFAULT_CONFIG)
     migrate_tier = False
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         for key, default in DEFAULT_CONFIG.items():
             value = data.get(key)
             if isinstance(value, type(default)):
@@ -788,6 +853,11 @@ def terminal_candidates():
 
 
 def launch_terminal(cwd, command=""):
+    if win_compat.IS_WINDOWS or win_compat.IS_MACOS:
+        env = os.environ.copy()
+        env["PATH"] = claude_path_env()
+        return win_compat.launch_terminal(cwd, command, env=env)
+
     path_env = claude_path_env()
     parts = [f"cd {shlex.quote(cwd)}", f"export PATH={shlex.quote(path_env)}"]
     if command:
@@ -1133,7 +1203,12 @@ class ClaudeWorker(QObject):
         if not self._cwd:
             raise RuntimeError("请先选择一个项目目录")
         executable = find_claude()
-        if not executable:
+        # Windows 的 npm 安装只有 claude.cmd，SDK 会拒绝执行批处理 shim；
+        # 这里给它 claude.exe（原生安装或 SDK 自带），找不到就交给 SDK 自己找。
+        cli_path = executable
+        if win_compat.IS_WINDOWS:
+            cli_path = find_native_claude_exe()
+        if not executable and not cli_path:
             raise RuntimeError("环境变量 PATH 中找不到 claude 命令，请确认 Claude Code 已安装")
         # 每次都重新合并 settings.json，cc-switch 切换服务商后无需重启控制台
         env = provider_env()
@@ -1147,7 +1222,7 @@ class ClaudeWorker(QObject):
             resume=self._resume,
             model=self._model or None,
             effort=self._effort or None,
-            cli_path=executable,
+            cli_path=cli_path or None,
             env=env,
             # 截图/大文件工具结果会产生超过默认 1 MiB 的单条 JSON 消息
             max_buffer_size=MAX_CLI_MESSAGE_BYTES,
@@ -2211,6 +2286,22 @@ class MediaWorker(QThread):
             self.failed.emit(f"无法启动生成脚本：{exc}")
             return
         lines = []
+        line_queue = None
+        if os.name == "nt":
+            # Windows 的 select() 只支持套接字，读管道要另起线程
+            line_queue = queue.Queue()
+
+            def _pump():
+                try:
+                    for raw in proc.stdout:
+                        line_queue.put(raw)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    line_queue.put(None)
+
+            threading.Thread(target=_pump, daemon=True).start()
+
         while True:
             if self._cancelled:
                 try:
@@ -2220,17 +2311,25 @@ class MediaWorker(QThread):
                     proc.kill()
                 self.failed.emit("已取消生成")
                 return
-            if proc.poll() is not None:
-                break
-            try:
-                ready, _, _ = select.select([proc.stdout], [], [], 0.4)
-            except (OSError, ValueError):
-                break
-            if not ready:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                continue
+            if line_queue is None:
+                if proc.poll() is not None:
+                    break
+                try:
+                    ready, _, _ = select.select([proc.stdout], [], [], 0.4)
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    continue
+            else:
+                try:
+                    line = line_queue.get(timeout=0.4)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
             line = line.rstrip()
             if line:
                 lines.append(line)
@@ -3574,8 +3673,7 @@ class CodeStudyPage(QWidget):
             self._load_study_path(actions[chosen]["path"])
 
     def _open_study_dir(self):
-        subprocess.Popen(["xdg-open", str(STUDY_DIR)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        win_compat.open_path(STUDY_DIR)
 
     def _load_study_path(self, path):
         try:
@@ -4514,12 +4612,8 @@ class CodeStudyPage(QWidget):
         if entry is None:
             self.status_note("还没有打开文件")
             return
-        if not shutil.which("code"):
+        if not win_compat.open_editor(entry["path"], entry["line"]):
             self.status_note("未找到 VS Code 的 code 命令")
-            return
-        subprocess.Popen(
-            ["code", "-g", f"{entry['path']}:{entry['line']}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def set_floating(self, floating):
         self._floating = bool(floating)
@@ -5600,9 +5694,7 @@ class CodeDevPage(QWidget):
             self._save_dev()
         elif chosen is act_open:
             DEV_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-            subprocess.Popen(["xdg-open", str(DEV_RECORDS_DIR)],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            win_compat.open_path(DEV_RECORDS_DIR)
         elif chosen in actions:
             self._load_dev_path(actions[chosen]["path"])
 
@@ -6274,10 +6366,8 @@ class CodeDevPage(QWidget):
             self._reload_file_tab(self._current_file)
 
     def _open_in_vscode(self):
-        if self._current_file and shutil.which("code"):
-            subprocess.Popen(["code", self._current_file],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+        if self._current_file:
+            win_compat.open_editor(self._current_file)
 
     # --------------------------------------------------------------- chat --
     def _markdown(self):
@@ -7979,7 +8069,7 @@ class MainWindow(QMainWindow):
         self.btn_open_editor = QPushButton("VS Code")
         self.btn_open_editor.setObjectName("Flat")
         self.btn_open_editor.clicked.connect(self._open_editor)
-        self.btn_open_editor.setVisible(bool(shutil.which("code")))
+        self.btn_open_editor.setVisible(bool(win_compat.find_editor()))
         header_actions.addWidget(self.btn_open_editor)
 
         header_row = QHBoxLayout()
@@ -8776,8 +8866,8 @@ class MainWindow(QMainWindow):
         if not target.exists():
             self.statusBar().showMessage("路径不存在", 3000)
             return
-        subprocess.Popen(["xdg-open", str(target)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not win_compat.open_path(target):
+            self.statusBar().showMessage("无法打开该路径", 3000)
 
     def _sync_skills(self):
         messages = []
@@ -9329,9 +9419,7 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(entry["sid"])
             self.statusBar().showMessage("已复制会话 ID", 2500)
         elif act_folder is not None and action is act_folder:
-            subprocess.Popen(["xdg-open", entry["cwd"]],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+            win_compat.open_path(entry["cwd"])
 
     def _preview_codex_session(self, entry):
         dialog = CodexSessionDialog(entry, self)
@@ -9348,7 +9436,8 @@ class MainWindow(QMainWindow):
         cwd = entry.get("cwd") or self.current_project or str(Path.home())
         if not Path(cwd).is_dir():
             cwd = str(Path.home())
-        command = f"{shlex.quote(executable)} resume {shlex.quote(entry['sid'])}"
+        command = (f"{win_compat.quote_arg(executable)} resume "
+                   f"{win_compat.quote_arg(entry['sid'])}")
         try:
             terminal = launch_terminal(cwd, command)
         except Exception as exc:  # noqa: BLE001 - 面向用户的错误提示
@@ -12702,13 +12791,13 @@ class MainWindow(QMainWindow):
 
     def _open_folder(self):
         if self.current_project:
-            subprocess.Popen(["xdg-open", self.current_project],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not win_compat.open_path(self.current_project):
+                self.statusBar().showMessage("无法打开该文件夹", 3000)
 
     def _open_editor(self):
-        if self.current_project and shutil.which("code"):
-            subprocess.Popen(["code", self.current_project],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.current_project and not win_compat.open_editor(self.current_project):
+            self.statusBar().showMessage(
+                "未找到 VS Code 的 code 命令，无法打开编辑器", 4000)
 
     def _copy_path(self):
         if self.current_project:
@@ -12717,16 +12806,18 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- misc --
     def _probe_claude(self):
-        executable = find_claude()
+        executable = find_native_claude_exe() or find_claude()
         if not executable:
             self.version_label.setText("未检测到 claude 命令")
             if not SDK_AVAILABLE:
                 self._add_chat_note(
                     "无法在界面内对话：找不到 claude 命令，且未安装 Claude Agent SDK。")
             return
+        # Windows 上的 claude.cmd 必须经 cmd.exe 启动
+        argv = win_compat.wrap_argv([executable, "--version"])
         self._claude_proc = QProcess(self)
         self._claude_proc.finished.connect(self._on_version_ready)
-        self._claude_proc.start(executable, ["--version"])
+        self._claude_proc.start(argv[0], argv[1:])
 
     def _on_version_ready(self, _code, _status):
         output = bytes(self._claude_proc.readAllStandardOutput()).decode(
@@ -12853,7 +12944,28 @@ class MainWindow(QMainWindow):
             super().closeEvent(event)
 
 
+def install_exception_guard():
+    """捕获槽函数里未处理的异常，避免 PyQt5 直接 abort 整个程序。
+
+    PyQt5 从 5.5 起，信号槽回调中逃逸的异常会在打印 traceback 后调用
+    qFatal() 结束进程；接管 sys.excepthook 后异常只会被记录并提示。
+    """
+    def hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        try:
+            QMessageBox.critical(
+                QApplication.activeWindow(), "程序错误",
+                f"{exc_type.__name__}: {exc}\n\n"
+                "这次操作没有完成，但程序会继续运行。\n"
+                "详细信息已输出到终端。")
+        except Exception:  # noqa: BLE001 - 提示失败时不影响主流程
+            pass
+
+    sys.excepthook = hook
+
+
 def main():
+    install_exception_guard()
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
