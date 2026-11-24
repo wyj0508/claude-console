@@ -323,6 +323,8 @@ class DualUIAcceptance(DualUIFixture):
     def test_repeated_toggle_refresh_swap_efforts_and_tier(self):
         self.load_test_models()
         w = self.window
+        # 本测试关注工作默认配置的持久化，先取消“仅本次对话”。
+        w.single_change_check.setChecked(False)
         single = (w._model, w._effort)
         tiers = ('L0', 'L2', 'L4')
         for index in range(12):
@@ -465,6 +467,7 @@ class DualUIAcceptance(DualUIFixture):
 
     def test_tier_is_saved_immediately(self):
         w = self.window
+        w.single_change_check.setChecked(False)
         index = w.dual_tier_combo.findData('L4')
         w.dual_tier_combo.setCurrentIndex(index)
         self.assertEqual(w.config['dual_tier'], 'L4')
@@ -473,6 +476,8 @@ class DualUIAcceptance(DualUIFixture):
 
     def test_review_checkbox_defaults_persists_and_keeps_selection(self):
         w = self.window
+        # 本测试关注工作默认配置的持久化，先取消“仅本次对话”。
+        w.single_change_check.setChecked(False)
         w.dual_check.setChecked(True)
         self.assertTrue(w.review_check.isChecked())
         self.assertTrue(w.config['dual_review_enabled'])
@@ -596,11 +601,13 @@ class DualUIAcceptance(DualUIFixture):
                         self.assertGreaterEqual(pos.y(), 0)
                         self.assertLessEqual(pos.y() + target.height(),
                                              w.model_config_scroll.viewport().height())
-                    # 底栏顺序：协作开关 → 模型配置 → 额度 → 停止 → 发送，互不重叠。
+                    # 协作开关已移入模型配置；底栏只保留入口与额度。
+                    self.assertEqual(row.indexOf(w.single_change_check) >= 0, True)
+                    self.assertEqual(row.indexOf(w.dual_check) >= 0, True)
                     bottom = w.chat_tab.layout().itemAt(
                         w.chat_tab.layout().count() - 1).layout()
                     items = [bottom.itemAt(i).widget() for i in range(bottom.count())]
-                    order = [w.dual_check, w.btn_model_config, w.dual_balance_panel,
+                    order = [w.btn_model_config, w.dual_balance_panel,
                              w.btn_stop, w.btn_send]
                     indexes = [items.index(x) for x in order]
                     self.assertEqual(indexes, sorted(indexes))
@@ -608,7 +615,7 @@ class DualUIAcceptance(DualUIFixture):
                         self.assertLessEqual(a.geometry().right(), b.x())
                     self.assertLess(w.dual_balance_panel.geometry().right(), w.btn_stop.x())
                     self.assertLess(w.btn_stop.geometry().right(), w.btn_send.x())
-                    self.assertGreater(w.dual_check.y(), w.chat_input.geometry().bottom())
+                    self.assertEqual(w.dual_check.parentWidget(), w.model_config_panel)
                     # 再点一次收起。
                     w.btn_model_config.click()
                     for _ in range(2):
@@ -616,6 +623,44 @@ class DualUIAcceptance(DualUIFixture):
                     self.assertFalse(w.model_config_scroll.isVisible())
                     self.assertFalse(w.btn_model_config.isChecked())
                     self.assertIn('▾', w.btn_model_config.text())
+
+    def test_model_config_scope_global_and_current_chat(self):
+        self.load_test_models()
+        w = self.window
+        # 每个对话默认勾选“仅本次对话”。
+        self.assertTrue(w.single_change_check.isChecked())
+
+        # 默认修改只作用于当前对话，不改工作默认配置。
+        w.dual_check.setChecked(True)
+        self.assertFalse(w.config['dual_mode'])
+        self.assertTrue(
+            w._chat_state()['model_config_override']['dual_mode'])
+
+        # 取消勾选后改回工作默认配置。
+        w.single_change_check.setChecked(False)
+        self.assertIsNone(w._chat_state()['model_config_override'])
+        self.assertFalse(w.dual_check.isChecked())
+        w.dual_check.setChecked(True)
+        self.assertTrue(w.config['dual_mode'])
+
+        # 切到另一个项目：新对话同样默认勾选，并使用工作默认配置。
+        first = w.current_project
+        w.current_project = first + '-other'
+        w._restore_model_config_for_chat()
+        self.assertTrue(w.single_change_check.isChecked())
+        self.assertTrue(w.dual_check.isChecked())
+
+        # 切回来保留该对话取消勾选的选择。
+        w.current_project = first
+        w._restore_model_config_for_chat()
+        self.assertFalse(w.single_change_check.isChecked())
+        self.assertTrue(w.dual_check.isChecked())
+
+        # 新对话重置为本对话覆盖，并重新默认勾选。
+        w._new_chat()
+        self.assertTrue(w.single_change_check.isChecked())
+        self.assertTrue(w.dual_check.isChecked())
+        self.assertIsNone(w._chat_state()['model_config_override'])
 
     def test_model_config_toggle_keeps_selection_and_never_auto_expands(self):
         self.load_test_models()
@@ -884,5 +929,57 @@ class ConfigMigration(unittest.TestCase):
                 self.assertFalse(m.load_config()['dual_review_enabled'])
 
 
-if __name__ == '__main__':
+class UsageAndContinuityUI(DualUIFixture):
+    def test_sdk_result_emits_usage_and_saves_metadata(self):
+        worker = m.ClaudeWorker()
+        worker._model = 'test-model'
+        seen = []; worker.result.connect(seen.append)
+        message = m.ResultMessage(subtype='success', duration_ms=20, duration_api_ms=10,
+                                  is_error=False, num_turns=1, session_id='sdk-session',
+                                  usage=dict(input_tokens=10, cache_read_input_tokens=90,
+                                             cache_creation_input_tokens=0, output_tokens=5),
+                                  result='private result')
+        with tempfile.TemporaryDirectory() as root, patch.object(d, 'RUN_STATE_ROOT', Path(root) / 'runs'):
+            worker._handle(message); worker._handle(message)
+            self.assertEqual(seen[0]['metrics']['input_tokens'], 100)
+            self.assertEqual(seen[0]['metrics']['cache_hit_rate'], .9)
+            self.assertEqual([s['resumed'] for s in seen], [False, True])
+            self.assertNotIn('private result', Path(seen[0]['usage_path']).read_text())
+            state = self.window._chat_state()
+            self.window._on_chat_result(state, seen[0])
+            self.assertIn('缓存命中 90.0%', state['blocks'][-1]['text'])
+            self.assertIn('费用未知', state['blocks'][-1]['text'])
+
+    def test_completed_sessions_delta_and_new_chat_are_conversation_scoped(self):
+        w = self.window
+        self.load_test_models()
+        state = w._chat_state()
+        sessions = [{'key': ['opaque'], 'id': 's'}]
+        w._on_dual_completed(state, dict(ok=True, session_state=sessions, stats={}, records=[]))
+        self.assertEqual(state['dual_session_state'], sessions)
+        state['blocks'].append({'kind': 'user', 'text': 'intervening constraint'})
+        with patch.object(d.DualRunThread, 'start'), \
+             patch.object(d, 'find_codex_binary', return_value='/fake/codex'), \
+             patch.object(m, 'find_claude', return_value='/fake/claude'):
+            w._send_dual_message('new request', 'new request')
+            thread = state['dual_thread']
+            self.assertEqual(thread.context_delta, '用户：intervening constraint')
+            self.assertEqual(thread._resume_candidates, sessions)
+            w._on_dual_thread_finished(state)
+        w._new_chat()
+        self.assertEqual(state['dual_session_state'], [])
+        self.assertEqual(state['dual_history_cursor'], 0)
+        self.assertNotIn('dual_state_dir', state)
+
+    def test_unknown_cost_and_partial_cache_are_visible(self):
+        w = self.window; state = w._chat_state()
+        w._on_dual_completed(state, dict(ok=False, stats={'master': dict(calls=2, seconds=1,
+            cache_measured_calls=1, cache_hit_rate=.9, input_tokens=100)}, records=[]))
+        text = state['blocks'][-1]['text']
+        self.assertIn('费用未知', text)
+        self.assertIn('缓存命中 90.0%', text)
+        self.assertIn('缓存数据 1/2 次', text)
+
+
+if __name__ == "__main__":
     unittest.main()

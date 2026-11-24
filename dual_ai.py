@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import os
 import queue
 import re
@@ -36,6 +38,35 @@ CODEX_MODEL_CACHE = CODEX_HOME / "models_cache.json"
 CODEX_AUTH = CODEX_HOME / "auth.json"
 RUN_STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME") or
                       (Path.home() / ".local/state")) / "claude-console/dual-runs"
+
+# Gemini CLI（@google/gemini-cli）：登录状态与模型目录都在 ~/.gemini。
+GEMINI_HOME = Path(os.environ.get("GEMINI_CLI_HOME") or
+                   (Path.home() / ".gemini")).expanduser()
+GEMINI_OAUTH = GEMINI_HOME / "oauth_creds.json"
+GEMINI_SETTINGS = GEMINI_HOME / "settings.json"
+GEMINI_MODEL_CACHE_TTL = 600
+_GEMINI_MODEL_CACHE = {"at": 0.0, "models": [], "error": ""}
+
+# 无法运行 gemini --list-models 时的兜底（只用于展示，仍以 CLI 实际为准）。
+FALLBACK_GEMINI_MODELS = (
+    {"slug": "auto", "display_name": "Auto"},
+    {"slug": "gemini-2.5-pro", "display_name": "Gemini 2.5 Pro"},
+    {"slug": "gemini-3.5-flash", "display_name": "Gemini 3.5 Flash"},
+    {"slug": "gemini-3.1-flash-lite", "display_name": "Gemini 3.1 Flash Lite"},
+)
+
+GEMINI_BIN_CANDIDATES = (
+    "/usr/local/bin/gemini",
+    "/usr/bin/gemini",
+    "/snap/bin/gemini",
+    str(Path.home() / ".local/bin/gemini"),
+    str(Path.home() / ".npm-global/bin/gemini"),
+    str(Path.home() / ".volta/bin/gemini"),
+)
+GEMINI_PATH_PATTERNS = (
+    ".nvm/versions/node/*/bin/gemini",
+    ".local/share/fnm/node-versions/*/installation/bin/gemini",
+)
 
 CODEX_BIN_CANDIDATES = (
     "/usr/lib/chatgpt/resources/codex",
@@ -225,7 +256,7 @@ def tier_target_share(tier):
 # --------------------------------------------------------------------------- #
 @dataclass
 class RoleSpec:
-    source: str = "claude"       # claude | codex
+    source: str = "claude"       # claude | codex | gemini
     model: str = ""
     name: str = ""
     efforts: tuple = ()
@@ -339,6 +370,123 @@ def default_codex_model():
         if item["id"] == "gpt-6.1-sol":
             return item
     return models[0] if models else None
+
+
+# --------------------------------------------------------------------------- #
+# Gemini CLI 登录模型
+# --------------------------------------------------------------------------- #
+def find_gemini_binary():
+    """定位 gemini 可执行文件；桌面启动时 PATH 可能不含 nvm 目录。"""
+    found = shutil.which("gemini")
+    if found:
+        return found
+    import glob
+    matches = [Path(p) for p in GEMINI_BIN_CANDIDATES]
+    for pattern in GEMINI_PATH_PATTERNS:
+        matches.extend(Path(match) for match in glob.glob(
+            str(Path.home() / pattern)))
+    matches = [p for p in matches if p.is_file() and os.access(p, os.X_OK)]
+    if not matches:
+        return ""
+    return str(max(matches, key=lambda p: p.stat().st_mtime))
+
+
+def gemini_auth_state():
+    """返回 Gemini CLI 的登录方式；空字符串表示尚未登录。"""
+    if os.environ.get("GEMINI_API_KEY"):
+        return "api_key"
+    if GEMINI_OAUTH.is_file():
+        return "oauth"
+    try:
+        dotenv = (GEMINI_HOME / ".env").read_text(encoding="utf-8")
+        if re.search(r"^\s*(?:export\s+)?GEMINI_API_KEY\s*=\s*\S", dotenv, re.MULTILINE):
+            return "api_key"
+    except OSError:
+        pass
+    try:
+        settings = json.loads(GEMINI_SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    auth = ((settings.get("security") or {}).get("auth") or {}
+            if isinstance(settings, dict) else {})
+    return str(auth.get("selectedType") or "") if isinstance(auth, dict) else ""
+
+
+def gemini_ready():
+    return bool(find_gemini_binary()) and bool(gemini_auth_state())
+
+
+def gemini_settings_mtime():
+    """登录/设置变化时用于触发界面重新加载模型。"""
+    mtimes = []
+    for path in (GEMINI_OAUTH, GEMINI_SETTINGS, GEMINI_HOME / ".env"):
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else 0.0
+
+
+def _parse_gemini_models(text):
+    models = []
+    current = None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        match = re.match(r"^([A-Za-z0-9._-]+)\s+\(([^)]*)\)\s*$", line)
+        if match:
+            model_id = match.group(1)
+            label = match.group(2).strip() or model_id
+            name = model_id if label == model_id else label
+            current = {"source": "gemini", "id": model_id, "name": name,
+                       "efforts": [], "default_effort": "", "context": None}
+            models.append(current)
+            continue
+        if current is not None:
+            ctx = re.match(r"^Context limit:\s*([\d,]+)\s*input", line)
+            if ctx:
+                try:
+                    current["context"] = int(ctx.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+    return models
+
+
+def load_gemini_models(refresh=False):
+    """通过 gemini --list-models 读取登录后可用模型；结果短暂缓存。"""
+    now = time.monotonic()
+    if (not refresh and _GEMINI_MODEL_CACHE["models"]
+            and now - _GEMINI_MODEL_CACHE["at"] < GEMINI_MODEL_CACHE_TTL):
+        return [dict(item) for item in _GEMINI_MODEL_CACHE["models"]]
+    binary = find_gemini_binary()
+    if not binary:
+        _GEMINI_MODEL_CACHE.update({"at": now, "models": [], "error": "未安装 gemini"})
+        return []
+    env = os.environ.copy()
+    bin_dir = str(Path(binary).parent)
+    if bin_dir not in env.get("PATH", "").split(os.pathsep):
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    try:
+        proc = subprocess.run(
+            [binary, "--list-models"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15, env=env)
+        models = _parse_gemini_models(proc.stdout)
+        error = ""
+        if not models:
+            error = (proc.stderr or proc.stdout or "gemini --list-models 无输出").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        models, error = [], f"{type(exc).__name__}: {exc}"
+    if not models:
+        models = [{"source": "gemini", "id": item["slug"],
+                   "name": item["display_name"], "efforts": [],
+                   "default_effort": "", "context": None}
+                  for item in FALLBACK_GEMINI_MODELS]
+    _GEMINI_MODEL_CACHE.update({"at": now, "models": models, "error": error})
+    return [dict(item) for item in models]
+
+
+def peek_gemini_models():
+    """不触发子进程，只返回已缓存的模型列表（供界面同步填充）。"""
+    return [dict(item) for item in _GEMINI_MODEL_CACHE["models"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -492,6 +640,12 @@ def fetch_balance(spec, claude_env=None):
     env = claude_env or {}
     if spec.source == "codex":
         return fetch_codex_balance(env)
+    if spec.source == "gemini":
+        state = gemini_auth_state()
+        if not state:
+            return {"ok": False, "text": "未登录 Gemini", "detail": ""}
+        return {"ok": True, "text": "Gemini 已登录",
+                "detail": f"登录方式：{state}\n额度请在 Gemini CLI 中查看"}
     return fetch_claude_balance(env)
 
 
@@ -533,8 +687,9 @@ class AgentResult:
     ok: bool = False
     text: str = ""
     error: str = ""
-    cost_usd: float = 0.0
+    cost_usd: float | None = None
     usage: dict = field(default_factory=dict)
+    model_usage: dict = field(default_factory=dict)
     tools: list = field(default_factory=list)
     session_id: str = ""
     returncode: int = 0
@@ -542,15 +697,227 @@ class AgentResult:
     cancelled: bool = False
 
 
+# 交接预算默认值（估算 token，不是计费 token）。可通过 DualRunThread 参数覆盖。
+HANDOFF_TOKEN_BUDGET = 1200
+TOKEN_ESTIMATE_METHOD = "heuristic-ascii/4+cjk/1.5"
+# 这些工具可能产生副作用；重复出现只记录，绝不自动跳过或去重执行。
+SIDE_EFFECT_TOOLS = {
+    "bash", "exec", "shell", "edit", "write", "notebookedit", "apply_patch",
+    "multiedit", "delete", "move", "rename", "mcp", "file_change",
+}
+
+
+def estimate_tokens(text):
+    """确定性估算，仅用于交接预算；不冒充服务商计费 token。
+
+    英文/ASCII 约 4 字符一个 token，中文等非 ASCII 约 1.5 字符一个 token。
+    结果向上取整，空文本为 0。
+    """
+    text = str(text or "")
+    if not text:
+        return 0
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    other_chars = len(text) - ascii_chars
+    return int(math.ceil(ascii_chars / 4.0 + other_chars / 1.5))
+
+
+def estimate_tokens_label():
+    return {"method": TOKEN_ESTIMATE_METHOD, "precision": "estimate", "billable": False}
+
+
+def condense_output(text, max_chars=4000, max_lines=80, source_ref=""):
+    """按规则筛选长日志/工具输出：保留错误、关键行和首尾，去重并标注原文位置。
+
+    不返回原始全文；调用方应保留 source_ref 以便按需定位。
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+    error_pattern = re.compile(
+        r"error|fail|traceback|exception|denied|not found|timeout|错误|失败|异常|超时|拒绝",
+        re.IGNORECASE)
+    kept, seen_repeats = [], []
+    lines = text.splitlines()
+    repeat = 0
+    for line in lines:
+        previous = kept[-1] if kept else None
+        if line == previous:
+            repeat += 1
+            continue
+        if repeat:
+            seen_repeats.append(repeat)
+            kept.append(f"… 重复 {repeat} 行已折叠")
+            repeat = 0
+        kept.append(line)
+    if repeat:
+        seen_repeats.append(repeat)
+        kept.append(f"… 重复 {repeat} 行已折叠")
+    total = len(kept)
+    if total <= max_lines and len(text) <= max_chars:
+        return text
+    head = kept[:max(4, max_lines // 3)]
+    tail = kept[-max(4, max_lines // 3):]
+    middle = kept[len(head):len(kept) - len(tail)]
+    errors = [line for line in middle if error_pattern.search(line)][:max_lines // 3]
+    omitted = max(0, len(middle) - len(errors))
+    marker = (f"… 省略 {omitted} 行（原文：{source_ref or '调用记录'}）" if omitted else
+              f"（原文：{source_ref or '调用记录'}）")
+    condensed = head + ([marker] if marker else []) + errors + tail
+    result = "\n".join(condensed)
+    if len(result) > max_chars:
+        result = result[:max_chars] + f"\n… 已截断（原文：{source_ref or '调用记录'}）"
+    return result
+
+
+def _stable_json(value):
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def normalized_tool_call(tool):
+    """规范化工具调用标识：名称 + 稳定序列化输入。用于重复事件识别，不落原文。"""
+    tool = tool if isinstance(tool, dict) else {}
+    name = str(tool.get("name") or tool.get("tool") or "工具").strip()
+    signature = hashlib.sha256(
+        (name + "\0" + _stable_json(tool.get("input") or {})).encode("utf-8")).hexdigest()
+    resource = ""
+    data = tool.get("input") if isinstance(tool.get("input"), dict) else {}
+    # 只保留文件类定位；命令/请求正文可能包含凭据，不写入调用日志。
+    for key in ("file_path", "path", "filename", "target"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            resource = value[:400]
+            break
+    kind = "side_effect" if name.lower() in SIDE_EFFECT_TOOLS else "read"
+    return {"name": name, "signature": signature, "resource": resource, "kind": kind}
+
+
+class DuplicateTracker:
+    """记录重复读取/工具调用；有副作用的调用只计数，不自动跳过。"""
+
+    def __init__(self):
+        self.seen = {}
+        self.duplicates = 0
+        self.necessary_rechecks = 0
+
+    def observe(self, tools, versions=None):
+        versions = versions or {}
+        events = []
+        for tool in tools or []:
+            event = normalized_tool_call(tool)
+            prior = self.seen.get(event["signature"])
+            resource = event["resource"]
+            version = versions.get(resource)
+            duplicate = prior is not None
+            necessary = bool(duplicate and event["kind"] == "read"
+                             and prior.get("version") != version)
+            if not duplicate or necessary:
+                self.seen[event["signature"]] = {
+                    "version": version, "resource": resource,
+                    "count": (prior or {}).get("count", 0) + 1}
+            elif prior is not None:
+                prior["count"] = prior.get("count", 1) + 1
+            if duplicate:
+                self.duplicates += 1
+                if necessary:
+                    self.necessary_rechecks += 1
+            events.append(dict(event, duplicate=duplicate,
+                               necessary_recheck=necessary,
+                               auto_skipped=False))
+        return events
+
+
+def price_usage(metrics, model, pricing):
+    """可选：只有提供带来源和版本的计费配置时才计算费用，否则返回未知。"""
+    if not isinstance(pricing, dict) or not isinstance(model, str):
+        return None
+    price = (pricing.get("models") or {}).get(model)
+    if not isinstance(price, dict) or not pricing.get("source") or not pricing.get("version"):
+        return None
+    total = 0.0
+    for key, factor in (("uncached_input_tokens", price.get("input_per_million")),
+                        ("cache_read_input_tokens", price.get("cache_read_per_million")),
+                        ("cache_write_input_tokens", price.get("cache_write_per_million")),
+                        ("output_tokens", price.get("output_per_million"))):
+        value = metrics.get(key)
+        if value is None or not isinstance(factor, (int, float)):
+            return None
+        total += float(value) * float(factor) / 1_000_000
+    return total
+
+
+def usage_metrics(source, usage):
+    """Claude input excludes cache; Codex input includes cache. Unknown stays None."""
+    usage = usage if isinstance(usage, dict) else {}
+    def count(key):
+        value = usage.get(key)
+        return int(value) if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                              and math.isfinite(value) and value >= 0) else None
+    raw = count("input_tokens")
+    output = count("output_tokens")
+    hosted = source in ("codex", "gemini")
+    read = count("cached_input_tokens" if hosted else "cache_read_input_tokens")
+    write = count("cache_write_input_tokens" if hosted else "cache_creation_input_tokens")
+    reasoning = count("reasoning_output_tokens")
+    if reasoning is None:
+        reasoning = count("reasoning_tokens")
+    if hosted:
+        total = raw
+        # Codex / Gemini's cached input is a subset of input_tokens, not extra input.
+        uncached = max(0, raw - read - (write or 0)) if raw is not None and read is not None else None
+    else:
+        total = raw + read + write if None not in (raw, read, write) else None
+        uncached = raw
+    valid_cache = (total is not None and read is not None and read + (write or 0) <= total)
+    return {"input_tokens": total, "uncached_input_tokens": uncached,
+            "cache_read_input_tokens": read, "cache_write_input_tokens": write,
+            "output_tokens": output, "reasoning_tokens": reasoning,
+            "cache_hit_rate": read / total if valid_cache and total > 0 else None}
+
+
+def usage_text(metrics):
+    """Shared UI wording for SDK, CLI and the offline comparison tool."""
+    parts = []
+    for key, label in (("input_tokens", "输入"), ("output_tokens", "输出"),
+                       ("uncached_input_tokens", "未缓存输入"),
+                       ("cache_read_input_tokens", "缓存读取"),
+                       ("cache_write_input_tokens", "缓存写入"),
+                       ("reasoning_tokens", "推理")):
+        value = metrics.get(key)
+        if value is not None:
+            parts.append(f"{label} {value:,}")
+    rate = metrics.get("cache_hit_rate")
+    parts.append(f"缓存命中 {rate:.1%}" if rate is not None else "缓存命中未知")
+    return " · ".join(parts)
+
+
+def record_single_usage(info):
+    """Store metadata only; never log SDK prompt, credentials or tool arguments."""
+    root = RUN_STATE_ROOT.parent / "single-calls"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = {k: info.get(k) for k in (
+        "session_id", "model", "usage", "metrics", "cost", "duration", "elapsed",
+        "is_error", "subtype", "resumed", "tool_count", "model_usage")}
+    fd, name = tempfile.mkstemp(prefix="call-", suffix=".tmp", dir=root)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(dict(metadata, source="claude", mode="single"), stream, ensure_ascii=False, indent=2)
+    path = Path(name).with_suffix(".json")
+    Path(name).replace(path)
+    return str(path)
+
+
 class CliAgent:
     """一次非交互式 agent 调用，支持流式回调与取消。"""
 
     def __init__(self, cwd, env=None, claude_path="", codex_path="",
-                 cancel_event=None, timeout=900):
+                 gemini_path="", cancel_event=None, timeout=900):
         self.cwd = cwd
         self.env = dict(env or os.environ.copy())
         self.claude_path = claude_path
         self.codex_path = codex_path
+        self.gemini_path = gemini_path
         self.cancel_event = cancel_event or threading.Event()
         self.timeout = timeout
         self._proc = None
@@ -584,7 +951,7 @@ class CliAgent:
     def _popen(self, cmd, stdin_text):
         env = self.env.copy()
         path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-        for binary in (self.claude_path, self.codex_path):
+        for binary in (self.claude_path, self.codex_path, self.gemini_path):
             if binary:
                 bin_dir = str(Path(binary).parent)
                 if bin_dir and bin_dir not in path.split(os.pathsep):
@@ -686,6 +1053,8 @@ class CliAgent:
         cmd = [self.claude_path, "-p", "--output-format", "stream-json",
                "--verbose", "--include-partial-messages",
                "--permission-mode", mode]
+        if getattr(self, "report_only", False):
+            cmd += ["--tools", ""]
         if spec.model:
             cmd += ["--model", spec.model]
         if session_id:
@@ -695,6 +1064,7 @@ class CliAgent:
             cmd += ["--effort", effort]
 
         result = AgentResult()
+        message_usage = {}
         last_text = ""
         started = time.monotonic()
 
@@ -721,6 +1091,8 @@ class CliAgent:
                 return
             if kind == "assistant":
                 message = event.get("message") or {}
+                if message.get("id") and isinstance(message.get("usage"), dict):
+                    message_usage[message["id"]] = message["usage"]
                 texts, tools = [], []
                 for block in message.get("content") or []:
                     if not isinstance(block, dict):
@@ -742,12 +1114,15 @@ class CliAgent:
                 return
             if kind == "result":
                 result.session_id = str(event.get("session_id") or result.session_id)
-                result.cost_usd += float(event.get("total_cost_usd") or 0)
+                if isinstance(event.get("total_cost_usd"), (int, float)):
+                    result.cost_usd = float(event["total_cost_usd"])
+                if isinstance(event.get("modelUsage"), dict):
+                    result.model_usage = event["modelUsage"]
                 usage = event.get("usage") or {}
                 if isinstance(usage, dict):
                     for key, value in usage.items():
                         if isinstance(value, (int, float)):
-                            result.usage[key] = result.usage.get(key, 0) + value
+                            result.usage[key] = value
                 if event.get("is_error"):
                     result.error = str(event.get("result") or "Claude 返回错误")
                 elif event.get("result"):
@@ -760,6 +1135,12 @@ class CliAgent:
             result.elapsed = time.monotonic() - started
             return result
         rc, stderr_lines, timed_out = self._stream(proc, handle)
+        if not result.usage:
+            # Preserve observed partial usage on timeout/error; result usage is authoritative.
+            for usage in message_usage.values():
+                for key, value in usage.items():
+                    if isinstance(value, (int, float)):
+                        result.usage[key] = result.usage.get(key, 0) + value
         result.returncode = rc or 0
         result.elapsed = time.monotonic() - started
         result.text = last_text.strip()
@@ -893,10 +1274,110 @@ class CliAgent:
             result.ok = True
         return result
 
+    # --------------------------------------------------------------- gemini --
+    def run_gemini(self, prompt, spec, permission_mode="acceptEdits",
+                   read_only=False, on_delta=None, on_message=None,
+                   on_tool=None, session_id=""):
+        if not self.gemini_path:
+            return AgentResult(error="找不到 gemini 命令")
+        approval = "plan" if read_only else (
+            "yolo" if permission_mode == "bypassPermissions" else "auto_edit")
+        cmd = [self.gemini_path, "-p", prompt, "--skip-trust",
+               "--output-format", "stream-json", "--approval-mode", approval]
+        if spec.model:
+            cmd += ["-m", spec.model]
+        if session_id:
+            cmd += ["--resume", session_id]
+
+        result = AgentResult()
+        parts = []
+        started = time.monotonic()
+
+        def handle(raw):
+            line = raw.strip()
+            if not line.startswith("{"):
+                return
+            try:
+                event = json.loads(line)
+            except ValueError:
+                return
+            kind = event.get("type")
+            if kind == "init":
+                result.session_id = str(event.get("session_id") or "")
+                return
+            if kind == "message":
+                if str(event.get("role") or "") != "assistant":
+                    return
+                chunk = str(event.get("content") or "")
+                if chunk:
+                    parts.append(chunk)
+                    if on_delta:
+                        on_delta(chunk)
+                return
+            if kind == "tool_use":
+                name = str(event.get("tool_name") or "工具")
+                data = {"parameters": event.get("parameters"),
+                        "tool_id": event.get("tool_id")}
+                result.tools.append({"name": name, "input": data})
+                if on_tool:
+                    on_tool(name, data)
+                return
+            if kind == "error":
+                message = str(event.get("message") or "")
+                if message and str(event.get("severity") or "") == "error":
+                    result.error = message
+                return
+            if kind == "result":
+                if str(event.get("status") or "") == "error":
+                    error = event.get("error") or {}
+                    message = (error.get("message") if isinstance(error, dict)
+                               else str(error)) or result.error
+                    result.error = message or "Gemini 执行失败"
+                stats = event.get("stats") or {}
+                if isinstance(stats, dict):
+                    usage = {}
+                    for key, source_key in (
+                            ("input_tokens", "input_tokens"),
+                            ("output_tokens", "output_tokens"),
+                            ("cached_input_tokens", "cached"),
+                            ("total_tokens", "total_tokens")):
+                        value = stats.get(source_key)
+                        if isinstance(value, (int, float)):
+                            usage[key] = value
+                    result.usage.update(usage)
+                return
+
+        try:
+            proc = self._popen(cmd, "")
+        except OSError as exc:
+            result.error = f"启动 gemini 失败：{exc}"
+            result.elapsed = time.monotonic() - started
+            return result
+        rc, stderr_lines, timed_out = self._stream(proc, handle)
+        result.returncode = rc or 0
+        result.elapsed = time.monotonic() - started
+        result.text = "".join(parts).strip()
+        result.cancelled = self.cancel_event.is_set()
+        if timed_out:
+            result.error = f"Gemini 调用超时（{self.timeout} 秒）"
+        elif result.cancelled:
+            result.error = "已取消"
+        elif rc != 0 and not result.error:
+            result.error = "Gemini 退出码 " + str(rc) + (
+                "：" + "\n".join(stderr_lines[-8:]) if stderr_lines else "")
+        result.ok = bool(result.text) and not result.error
+        if result.text and not result.error and on_message:
+            on_message(result.text, [])
+        return result
+
     def run(self, spec, prompt, permission_mode="acceptEdits", read_only=False,
             on_delta=None, on_message=None, on_tool=None, session_id=""):
         if spec.source == "codex":
             return self.run_codex(
+                prompt, spec, permission_mode, read_only,
+                on_delta, on_message, on_tool, session_id)
+        if spec.source == "gemini":
+            return self.run_gemini(
                 prompt, spec, permission_mode, read_only,
                 on_delta, on_message, on_tool, session_id)
         return self.run_claude(
@@ -904,11 +1385,109 @@ class CliAgent:
             on_delta, on_message, on_tool, session_id)
 
 
+class SingleCliThread(QThread):
+    """单模型模式使用 Codex / Gemini 登录模型时的一次命令行调用。
+
+    Claude 服务商仍走 Agent SDK（保留权限弹窗、开发模式等能力）；
+    其他来源用对应 CLI 非交互执行，信号与主界面的对话回调兼容。
+    """
+
+    delta = pyqtSignal(str)
+    message = pyqtSignal(str, list)
+    tool = pyqtSignal(str, dict)
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    busy_changed = pyqtSignal(bool)
+
+    def __init__(self, parent=None, cwd="", request="", spec=None,
+                 permission_mode="default", claude_path="", codex_path="",
+                 gemini_path="", env=None, session_id=""):
+        super().__init__(parent)
+        self.cwd = cwd
+        self.request = request
+        self.spec = spec or RoleSpec()
+        self.permission_mode = permission_mode or "default"
+        self.claude_path = claude_path
+        self.codex_path = codex_path
+        self.gemini_path = gemini_path
+        self.env = dict(env or os.environ.copy())
+        self.session_id = session_id or ""
+        self._cancel = threading.Event()
+        self._agent = None
+        self._lock = threading.Lock()
+
+    def cancel(self):
+        self._cancel.set()
+        with self._lock:
+            agent = self._agent
+        if agent is not None:
+            agent.cancel()
+
+    def run(self):
+        spec = self.spec
+        self.busy_changed.emit(True)
+        emitted = False
+
+        def on_message(text, tools):
+            nonlocal emitted
+            if text:
+                emitted = True
+                self.message.emit(text, tools or [])
+
+        agent = CliAgent(
+            self.cwd, env=self.env, claude_path=self.claude_path,
+            codex_path=self.codex_path, gemini_path=self.gemini_path,
+            cancel_event=self._cancel, timeout=1800)
+        with self._lock:
+            self._agent = agent
+        try:
+            result = agent.run(
+                spec, self.request, self.permission_mode,
+                on_delta=self.delta.emit,
+                on_message=on_message,
+                on_tool=lambda name, data: self.tool.emit(name, data or {}),
+                session_id=self.session_id)
+        except Exception as exc:  # noqa: BLE001 - 错误交给界面提示
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+            self.busy_changed.emit(False)
+            return
+        finally:
+            with self._lock:
+                self._agent = None
+        if result.cancelled:
+            self.error.emit("已取消")
+            self.busy_changed.emit(False)
+            return
+        if result.error and not result.ok:
+            self.error.emit(result.error)
+            self.busy_changed.emit(False)
+            return
+        if not emitted and result.text:
+            self.message.emit(result.text, [])
+        metrics = usage_metrics(spec.source, result.usage)
+        self.result.emit({
+            "session_id": result.session_id or self.session_id,
+            "is_error": False,
+            "result": result.text,
+            "cost": result.cost_usd,
+            "duration": int((result.elapsed or 0) * 1000),
+            "model": spec.model,
+            "source": spec.source,
+            "usage": result.usage,
+            "metrics": metrics,
+            "tool_count": len(result.tools or []),
+            "elapsed": result.elapsed,
+        })
+        self.busy_changed.emit(False)
+
+
 RESULT_INSTRUCTION = """
 交付协议：最后单独输出一行 DUAL_RESULT: 后接 JSON 对象：
 DUAL_RESULT: {"status":"passed","summary":"结果概述","verification":["实际运行的验证及结果"]}
 status 只能是 passed / blocked / failed。只有任务完成且必要验证通过才用 passed；
-无法验证、权限不足、需要用户操作或有未解决问题时用 blocked 或 failed。
+无法验证、权限不足或本阶段必需工作仍未完成时用 blocked 或 failed。
+用户明确留给自己执行的命令列在 pending_user_actions 字符串数组；若当前目标是准备材料，
+材料完成并验证后可 passed，但必须明确尚未实际发布，不能把用户保留的操作冒称已执行。
 verification 必须是非空字符串列表，写真实执行证据；无需运行测试的任务说明实际检查方式。
 """
 
@@ -924,6 +1503,12 @@ def delivery_report(result):
         report = json.loads(line[len("DUAL_RESULT:"):].strip())
     except ValueError:
         return None
+    # A redundant wrapper field must not erase valid per-task verification (historical T1/T3).
+    # Only absent evidence is derived; explicitly invalid evidence remains a protocol error.
+    if isinstance(report, dict) and "verification" not in report:
+        items = report.get("tasks")
+        if isinstance(items, list) and items and all(valid_report(item) for item in items):
+            report = dict(report, verification=[proof for item in items for proof in item["verification"]])
     return report if valid_report(report) else None
 
 
@@ -937,7 +1522,7 @@ def valid_report(report):
             and all(isinstance(x, str) and x.strip() for x in evidence)
             and all(isinstance(report.get(key, []), list)
                     and all(isinstance(x, str) and x.strip() for x in report.get(key, []))
-                    for key in ("changed_files", "decisions", "interfaces", "open_issues")))
+                    for key in ("changed_files", "decisions", "interfaces", "open_issues", "pending_user_actions")))
 
 
 def accepted_result(result):
@@ -976,11 +1561,21 @@ class RunJournal:
                     raise ValueError("上轮交接记录格式损坏")
                 if Path(original["cwd"]).resolve() != Path(cwd).resolve():
                     raise ValueError("上轮交接记录属于另一项目，已隔离")
-                if previous.get("protocol_version") not in (2, 3):
+                if previous.get("protocol_version") not in (2, 3, 4):
                     raise ValueError("上轮交接记录版本不兼容")
+                # 旧协议没有任务状态字段时保持未知，不补造完成结论。
+                task_state = previous.get("task_state")
+                if not isinstance(task_state, dict):
+                    task_state = {
+                        "status": "unknown",
+                        "note": "上轮协议未记录版本化任务状态；请核实上轮记录后再复用。",
+                        "previous_protocol_version": previous.get("protocol_version"),
+                    }
                 self.previous = self.write("previous.json", {
                     "source": str(previous_root), "plan": previous.get("plan", {}),
                     "records": previous.get("records", []),
+                    "protocol_version": previous.get("protocol_version"),
+                    "task_state": task_state,
                     "previous_checkpoint": previous.get("previous_checkpoint", ""),
                 })
             except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -989,17 +1584,43 @@ class RunJournal:
     def write(self, name, value):
         path = self.root / name
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.chmod(0o600)
-        temporary.replace(path)
+        try:
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(path)
+        finally:
+            # 序列化或替换失败时清理临时文件，原文件保持不变。
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                pass
         return str(path)
 
-    def call(self, role, label, result, resumed):
+    def call(self, role, label, result, resumed, source="", meta=None):
         self.calls += 1
+        meta = meta if isinstance(meta, dict) else {}
+        metrics = usage_metrics(source, result.usage)
         return self.write(f"call-{self.calls:03d}.json", {
             "role": role, "stage": label, "resumed": resumed,
             "session_id": result.session_id, "text": result.text,
             "error": result.error, "ok": result.ok, "usage": result.usage,
+            "error_digest": condense_output(result.error, max_chars=1200, max_lines=40,
+                                            source_ref=f"{label} 调用输出"),
+            "cost_usd": result.cost_usd, "elapsed": result.elapsed,
+            "returncode": result.returncode, "cancelled": result.cancelled,
+            "tool_count": len(result.tools), "model_usage": result.model_usage,
+            "source": source, "metrics": metrics,
+            "model": meta.get("model", ""), "provider": meta.get("provider", source),
+            "kind": meta.get("kind", ""), "handoff": meta.get("handoff"),
+            "switch_reason": meta.get("switch_reason", ""),
+            "duplicate_tool_calls": meta.get("duplicate_tool_calls", 0),
+            "necessary_rechecks": meta.get("necessary_rechecks", 0),
+            "summary_call": bool(meta.get("summary_call")),
+            "tool_events": meta.get("tool_events", []),
+            "token_method": meta.get("token_method", "provider-usage"),
+            "cost_source": meta.get("cost_source"),
+            "cost_estimated": meta.get("cost_estimated"),
         })
 
 
@@ -1067,6 +1688,7 @@ def extract_ask(result):
         "need": str(value.get("need") or value.get("decision") or "").strip(),
         "tried": [str(x) for x in value.get("tried") or []
                   if str(x).strip()][:4] if isinstance(value.get("tried"), list) else [],
+        "completed": value.get("completed", []),
     }
     if not ask["problem"] and not ask["need"]:
         return None
@@ -1121,14 +1743,10 @@ def fallback_plan(user_request, tier="balanced"):
             "verify": "运行相关检查或测试",
         }]}
     if policy.id == L1:
-        return {"summary": "自动拆分：主 AI 实现疑难，执行 AI 核验。", "tasks": [
+        return {"summary": "最小回退：主 AI 实现并自行验证。", "tasks": [
             {"id": "T1", "title": "实现需求", "goal": user_request,
              "role": MASTER, "points": 8, "files": [], "ops": ["think", "execute"],
-             "acceptance": "按用户要求完成", "verify": "运行相关检查或测试"},
-            {"id": "T2", "title": "定位并核验改动", "goal": "读取 T1 的改动并运行验证",
-             "role": WORKER, "points": 3, "files": [],
-             "ops": ["read", "locate", "monitor"],
-             "acceptance": "改动位置和验证结果明确", "verify": "复核 T1 的验证结果"},
+             "acceptance": "按用户要求完成并实际验证", "verify": "运行相关检查或测试"},
         ]}
     return {"summary": "自动拆分：执行 AI 实现并监控，主 AI 验收。", "tasks": [
         {"id": "T1", "title": "实现需求", "goal": user_request,
@@ -1244,8 +1862,10 @@ class DualRunThread(QThread):
     def __init__(self, parent=None, cwd="", request="", context="",
                  master=None, worker=None, tier="balanced", share=None,
                  strategy="complete", permission_mode="default", effort="high",
-                 claude_path="", codex_path="", claude_env=None, previous_state="",
-                 review_enabled=True):
+                 claude_path="", codex_path="", gemini_path="", claude_env=None,
+                 previous_state="",
+                 review_enabled=True, session_state=None, context_delta=None,
+                 handoff_token_budget=None, pricing=None):
         super().__init__(parent)
         self.cwd = cwd
         self.request = request
@@ -1264,8 +1884,15 @@ class DualRunThread(QThread):
         self.effort = effort or ""
         self.claude_path = claude_path
         self.codex_path = codex_path
+        self.gemini_path = gemini_path
         self.claude_env = dict(claude_env or os.environ.copy())
         self.previous_state = previous_state
+        # Only the owning UI conversation supplies live session handles. A disk checkpoint
+        # alone is never sufficient authorization to resume another conversation.
+        self._resume_candidates = session_state if isinstance(session_state, list) else []
+        self.context_delta = context_delta
+        self._started_keys = set()
+        self._identity_cache = {}
         self._cancel = threading.Event()
         self._current = None
         self._current_lock = threading.Lock()
@@ -1281,10 +1908,38 @@ class DualRunThread(QThread):
         self._sessions = {}
         self._last_call_path = ""
         self._session_resets = 0
+        self._report_repairs = 0
         self._compressed_context = ""
         self._context_before = len(self.context)
         self._ask_count = 0
         self._prompt_chars = 0
+        # 版本化任务状态与预算内增量交接。
+        try:
+            budget = int(handoff_token_budget)
+        except (TypeError, ValueError):
+            budget = HANDOFF_TOKEN_BUDGET
+        self.handoff_token_budget = max(200, budget)
+        self.pricing = pricing if isinstance(pricing, dict) else None
+        self._revision = 0
+        self._history = []
+        self._ack = {MASTER: 0, WORKER: 0}
+        self._pending_handoff = None
+        self._last_handoff = None
+        self._handoff_log = []
+        self._artifacts = {}
+        self._artifact_cache = {}
+        self._switches = []
+        self._unconfirmed = []
+        self._resume_point = "尚未开始"
+        self._summary_calls = 0
+        self._duplicate_tracker = DuplicateTracker()
+        self._duplicate_tool_calls = 0
+        self._necessary_rechecks = 0
+        self._tool_call_count = 0
+        self._last_role = ""
+        self._last_switch_reason = ""
+        self._task_total = 0
+        self._task_index = 0
         # 进度快照：工作线程写入，界面线程只读，供「进度查询」实时显示。
         self._status_lock = threading.Lock()
         self._status_started = time.monotonic()
@@ -1397,23 +2052,478 @@ class DualRunThread(QThread):
         levels = supported_efforts(spec)
         return replace(spec, effort=effort if effort in levels else "")
 
+    def _session_key(self, role):
+        spec = self._effort_for(self._spec_for(role))
+        if spec.source not in self._identity_cache:
+            if spec.source == "claude":
+                keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                        "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                identity = [self.claude_env.get(k, "") for k in keys] + [self.claude_path]
+            elif spec.source == "gemini":
+                keys = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI")
+                identity = [self.claude_env.get(k, "") for k in keys] + [self.gemini_path]
+                try:
+                    identity.append(hashlib.sha256(
+                        GEMINI_OAUTH.read_bytes()).hexdigest())
+                except OSError:
+                    identity.append(gemini_auth_state())
+            else:
+                keys = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "CODEX_HOME")
+                identity = [self.claude_env.get(k, "") for k in keys] + [self.codex_path]
+                auth = Path(self.claude_env.get("CODEX_HOME") or CODEX_HOME) / "auth.json"
+                try:
+                    identity.append(hashlib.sha256(auth.read_bytes()).hexdigest())
+                except OSError:
+                    identity.append("")
+            self._identity_cache[spec.source] = hashlib.sha256(
+                json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+        return (role, spec.source, spec.model, spec.effort,
+                str(Path(self.cwd).resolve()), self.permission_mode, self._identity_cache[spec.source])
+
+    def _export_sessions(self):
+        return [{"key": list(key), "id": value} for key, value in self._sessions.items()]
+
+    # ------------------------------------------------ 版本化任务状态与交接 --
+    def _bump_revision(self, kind, summary="", task_id="", detail=None):
+        self._revision += 1
+        entry = {"revision": self._revision, "kind": kind, "task_id": str(task_id or ""),
+                 "summary": str(summary or "")[:500]}
+        if isinstance(detail, dict):
+            entry["detail"] = {k: v for k, v in detail.items() if v not in (None, "", [], {})}
+        self._history.append(entry)
+        if len(self._history) > 300:
+            self._history = self._history[-300:]
+        return self._revision
+
+    def _artifact_info(self, path):
+        """为产物计算可核对的版本/摘要；引用只表示可访问位置，不代表已被读取。"""
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path(self.cwd) / candidate
+        try:
+            resolved = candidate.resolve()
+            stat = resolved.stat()
+        except OSError:
+            return {"path": raw, "version": None, "digest": None, "locator": f"{raw}:1",
+                    "accessible": False, "note": "文件当前不可访问，需按路径重新核实"}
+        key = (str(resolved), stat.st_mtime_ns, stat.st_size)
+        cached = self._artifact_cache.get(key)
+        if cached is None:
+            digest = None
+            method = ""
+            try:
+                with resolved.open("rb") as stream:
+                    if stat.st_size <= 2 * 1024 * 1024:
+                        digest = hashlib.sha256(stream.read()).hexdigest()
+                        method = "sha256-full"
+                    else:
+                        digest = hashlib.sha256(stream.read(256 * 1024)).hexdigest()
+                        method = "sha256-prefix+size"
+            except OSError:
+                pass
+            cached = {"digest": digest, "method": method, "size": stat.st_size}
+            self._artifact_cache[key] = cached
+        digest = cached["digest"]
+        try:
+            display = str(resolved.relative_to(Path(self.cwd).resolve()))
+        except (ValueError, OSError):
+            display = str(resolved)
+        return {"path": display or raw, "version": (digest or "")[:12] or None,
+                "digest": digest, "digest_method": cached["method"],
+                "size": cached["size"], "locator": f"{display or raw}:1",
+                "accessible": True, "note": "引用不代表模型已读取文件内容"}
+
+    def _refresh_artifacts(self):
+        for record in self._records:
+            report = record.get("report") or {}
+            for path in report.get("changed_files") or []:
+                info = self._artifact_info(path)
+                if not info:
+                    continue
+                info["task_id"] = record.get("id", "")
+                info["revision"] = record.get("revision", 0)
+                self._artifacts[info["path"]] = info
+        return self._artifacts
+
+    def _next_action(self):
+        if self._unconfirmed:
+            first = self._unconfirmed[-1]
+            return (f"先核对未确认操作（{first.get('label') or first.get('task_id')}，"
+                    f"记录：{first.get('call_ref') or '见共享状态卡'}）：确认是否已提交、"
+                    "文件是否已写入，再决定继续或重做；不要直接重放。")
+        for task in self._plan.get("tasks", []) if isinstance(self._plan, dict) else []:
+            if not any(r.get("id") == task.get("id") and r.get("ok") for r in self._records):
+                return f"执行任务 {task.get('id')}：{task.get('goal') or task.get('title')}"
+        if not self._records:
+            return "读取任务状态，确认 revision 后开始执行用户请求"
+        if self.review_mode != "none" and self._review_ok is None:
+            return "执行主 AI 验收，核对未完成项和整体验证"
+        return "汇总结果并交付用户；同时核对 pending 中的用户待执行项"
+
+    def _task_state(self):
+        """规范化的共享任务状态；事实、暂定判断和未完成项分别标注。"""
+        plan = self._plan if isinstance(self._plan, dict) else {}
+        self._refresh_artifacts()
+        completed, decisions, verification, pending = [], [], [], []
+        seen_decisions = set()
+        for record in self._records:
+            report = record.get("report") or {}
+            task_id = str(record.get("id") or "")
+            passed = bool(record.get("ok")) and report.get("status") == "passed"
+            evidence = [str(x) for x in report.get("verification") or [] if str(x).strip()]
+            fact_status = "verified" if (passed and evidence) else (
+                "provisional" if passed else "incomplete")
+            completed.append({
+                "id": task_id, "title": record.get("title", ""),
+                "status": fact_status,
+                "summary": str(report.get("summary") or record.get("text") or "")[:1200],
+                "evidence_ref": record.get("report_path", ""),
+                "revision": record.get("revision", 0),
+            })
+            items = []
+            reports = report.get("decisions") or []
+            if isinstance(reports, list):
+                items.extend(str(x) for x in reports if str(x).strip())
+            interfaces = report.get("interfaces") or []
+            if isinstance(interfaces, list):
+                items.extend("接口：" + str(x) for x in interfaces if str(x).strip())
+            for item in items[:20]:
+                key = (task_id, item[:300])
+                if key in seen_decisions:
+                    continue
+                seen_decisions.add(key)
+                decisions.append({
+                    "task_id": task_id, "decision": item[:600],
+                    "basis": record.get("report_path", ""),
+                    "conditions": "", "status": "confirmed" if passed else "provisional",
+                    "revision": record.get("revision", 0),
+                })
+            for index, item in enumerate(evidence[:20]):
+                verification.append({
+                    "task_id": task_id, "check": item[:500],
+                    "status": "verified" if passed else "provisional",
+                    "evidence_ref": f"{record.get('report_path', '')}#verification[{index}]",
+                    "revision": record.get("revision", 0),
+                })
+            for issue in report.get("open_issues") or []:
+                pending.append({"id": task_id, "status": "blocked",
+                                "reason": str(issue)[:500], "needs_check": False})
+            for action in report.get("pending_user_actions") or []:
+                pending.append({"id": task_id, "status": "pending_user_action",
+                                "reason": str(action)[:500], "needs_check": False})
+        for task in plan.get("tasks", []) if isinstance(plan.get("tasks"), list) else []:
+            if not any(r.get("id") == task.get("id") and r.get("ok") for r in self._records):
+                pending.append({"id": task.get("id"), "status": "incomplete",
+                                "reason": "尚未记录通过的逐项结果", "needs_check": False})
+        for operation in self._unconfirmed:
+            pending.append({
+                "id": operation.get("task_id", ""), "status": "unconfirmed",
+                "reason": f"{operation.get('label')}: {operation.get('reason')}"[:500],
+                "needs_check": True,
+                "call_ref": operation.get("call_ref", ""),
+                "tool_count": operation.get("tool_count", 0),
+            })
+        # 去重但保留未确认/阻塞状态优先。
+        unique, seen = [], set()
+        for item in pending:
+            key = (item.get("id"), item.get("status"), item.get("reason"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        artifacts = [{k: v for k, v in item.items() if k != "digest"}
+                     for item in self._artifacts.values()]
+        return {
+            "protocol_version": 4,
+            "task_id": (plan.get("tasks") or [{}])[0].get("id", "run") if plan.get("tasks") else "run",
+            "revision": self._revision,
+            "goal": self.request,
+            "goal_source": "current_request",
+            "supersedes_previous": bool(self._journal and self._journal.previous),
+            "constraints": list(plan.get("constraints") or []),
+            "completed": completed,
+            "decisions": decisions,
+            "artifacts": artifacts,
+            "verification": verification,
+            "pending": unique,
+            "unconfirmed_operations": list(self._unconfirmed),
+            "next_action": self._next_action(),
+            "resume_point": self._resume_point,
+            "tasks": [{"id": t.get("id"), "title": t.get("title"), "role": t.get("role")}
+                      for t in (plan.get("tasks") or []) if isinstance(t, dict)],
+            "switches": list(self._switches),
+            "history": list(self._history[-50:]),
+            "review_mode": self.review_mode,
+        }
+
+    def _state_brief(self):
+        state = self._task_state()
+        done = sum(1 for item in state["completed"]
+                   if item.get("status") == "verified")
+        total = len((self._plan or {}).get("tasks") or [])
+        return (f"任务状态 revision {state['revision']}：{total} 项任务，"
+                f"已验证 {done} 项；位置：{state['resume_point']}；"
+                f"下一步：{state['next_action']}")
+
+    @staticmethod
+    def _compact_state(state, level):
+        """按级别生成可序列化的交接卡；每级都保持完整 JSON。
+
+        切换明细和修订历史留在 state.json / call-*.json，不重复注入提示；
+        交接只需要当前结论、证据位置和下一步。
+        """
+        state = dict(state)
+        state.pop("history", None)
+        state.pop("switches", None)
+        if level == 0:
+            card = dict(state)
+        elif level == 1:
+            card = dict(state)
+            card["completed"] = [{
+                "id": x.get("id"), "status": x.get("status"),
+                "summary": str(x.get("summary") or "")[:200],
+                "evidence_ref": x.get("evidence_ref", ""),
+                "revision": x.get("revision", 0)} for x in state.get("completed", [])]
+            card["decisions"] = [{
+                "task_id": x.get("task_id"), "decision": str(x.get("decision") or "")[:200],
+                "status": x.get("status"), "basis": x.get("basis", ""),
+                "revision": x.get("revision", 0)} for x in state.get("decisions", [])]
+            card["verification"] = [{
+                "task_id": x.get("task_id"), "check": str(x.get("check") or "")[:160],
+                "status": x.get("status"), "evidence_ref": x.get("evidence_ref", ""),
+                "revision": x.get("revision", 0)} for x in state.get("verification", [])]
+            card["artifacts"] = [{
+                "path": x.get("path"), "version": x.get("version"),
+                "locator": x.get("locator"), "accessible": x.get("accessible"),
+                "revision": x.get("revision", 0)} for x in state.get("artifacts", [])]
+            card.pop("history", None)
+        else:
+            card = {
+                "protocol_version": state.get("protocol_version", 4),
+                "task_id": state.get("task_id", "run"),
+                "revision": state.get("revision", 0),
+                "goal": state.get("goal", ""),
+                "goal_source": state.get("goal_source", "current_request"),
+                "constraints": state.get("constraints", []),
+                "completed": [{"id": x.get("id"), "status": x.get("status")}
+                              for x in state.get("completed", [])],
+                "decisions": [{"task_id": x.get("task_id"), "status": x.get("status")}
+                              for x in state.get("decisions", [])],
+                "verification": [{"task_id": x.get("task_id"), "status": x.get("status")}
+                                 for x in state.get("verification", [])],
+                "artifacts": [{"path": x.get("path"), "version": x.get("version"),
+                               "accessible": x.get("accessible")}
+                              for x in state.get("artifacts", [])],
+                "pending": state.get("pending", []),
+                "unconfirmed_operations": state.get("unconfirmed_operations", []),
+                "next_action": state.get("next_action", ""),
+                "resume_point": state.get("resume_point", ""),
+                "overflow": True,
+                "omitted_sections": ["completed_detail", "decisions_detail",
+                                     "verification_detail", "artifact_digest", "history"],
+                "segment_refs": state.get("segment_refs", []),
+            }
+        # 兼容既有状态索引字段，便于旧读取方和测试。
+        card["tasks"] = state.get("tasks", card.get("tasks", []))
+        card["handoffs"] = state.get("handoffs", [])
+        return card
+
+    @staticmethod
+    def _with_legacy_index(state, records):
+        tasks = [{"id": t.get("id"), "title": t.get("title"), "role": t.get("role")}
+                 for t in (state.get("tasks") or [])]
+        handoffs = []
+        for record in records:
+            report = record.get("report") or {}
+            handoffs.append({
+                "id": record.get("id"), "ok": record.get("ok"),
+                "report": {"summary": report.get("summary", ""),
+                           "interfaces": report.get("interfaces", []),
+                           "verification_ref": record.get("report_path", "")},
+                "revision": record.get("revision", 0),
+            })
+        merged = dict(state)
+        merged["tasks"] = tasks
+        merged["handoffs"] = handoffs
+        return merged
+
+    def _handoff_card(self, role):
+        """首次发送必要状态；之后只发送该角色尚未确认的增量。"""
+        state = self._task_state()
+        state = self._with_legacy_index(state, self._records)
+        valid_revisions = [item.get("revision", 0) for item in self._history]
+        ack = self._ack.get(role, 0) if role in (MASTER, WORKER) else 0
+        gap = bool(ack and valid_revisions and ack < min(valid_revisions))
+        full = (not ack) or ack > self._revision or gap
+        if full:
+            card = dict(state)
+            card["handoff_mode"] = "full"
+        else:
+            changes = [item for item in self._history if item.get("revision", 0) > ack]
+            card = {
+                "protocol_version": 4,
+                "task_id": state.get("task_id", "run"),
+                "revision": state.get("revision", 0),
+                # 该角色已确认过目标且会话仍有效；增量只传变化，避免重复注入原文。
+                "goal_ref": "state.json#task_state.goal",
+                "goal_source": state.get("goal_source", "current_request"),
+                "supersedes_previous": state.get("supersedes_previous", False),
+                "constraints": state.get("constraints", []),
+                "completed": [x for x in state.get("completed", [])
+                              if x.get("revision", 0) > ack],
+                "decisions": [x for x in state.get("decisions", [])
+                              if x.get("revision", 0) > ack],
+                "artifacts": [x for x in state.get("artifacts", [])
+                              if x.get("revision", 0) > ack],
+                "verification": [x for x in state.get("verification", [])
+                                 if x.get("revision", 0) > ack],
+                "pending": state.get("pending", []),
+                "unconfirmed_operations": state.get("unconfirmed_operations", []),
+                "next_action": state.get("next_action", ""),
+                "resume_point": state.get("resume_point", ""),
+                "delta": {"from_revision": ack, "to_revision": state.get("revision", 0),
+                          "changes": changes},
+                "switches": state.get("switches", [])[-3:],
+                "handoff_mode": "delta",
+                "tasks": state.get("tasks", []),
+                "handoffs": [x for x in state.get("handoffs", [])
+                             if x.get("revision", 0) > ack],
+            }
+            if gap:
+                card["handoff_mode"] = "full_gap_fallback"
+                card = dict(state, handoff_mode="full_gap_fallback")
+        for level in (0, 1, 2):
+            shaped = self._compact_state(card, level)
+            text = json.dumps(shaped, ensure_ascii=False)
+            tokens = estimate_tokens(text)
+            if tokens <= self.handoff_token_budget or level == 2:
+                overflow = tokens > self.handoff_token_budget
+                if overflow:
+                    shaped["budget_exceeded"] = True
+                    shaped["budget_tokens"] = tokens
+                    shaped["segment_refs"] = [
+                        f"{self._journal.root / 'state.json'}#{key}" for key in
+                        ("completed", "decisions", "verification", "artifacts")]
+                    text = json.dumps(shaped, ensure_ascii=False)
+                    tokens = estimate_tokens(text)
+                meta = {
+                    "role": role, "mode": shaped.get("handoff_mode", "full"),
+                    "from_revision": ack, "revision": self._revision,
+                    "sent_revision": self._revision,
+                    "tokens_estimate": tokens, "method": TOKEN_ESTIMATE_METHOD,
+                    "budget": self.handoff_token_budget, "level": level,
+                    "trimmed": level > 0, "overflow": overflow,
+                    "billable": False,
+                }
+                self._pending_handoff = dict(meta)
+                self._last_handoff = meta
+                self._handoff_log.append(meta)
+                return text, meta
+        return "{}", {"error": "handoff"}
+
+    def _state_block(self, role=MASTER):
+        self._ensure_journal()
+        self._save_state()
+        text, meta = self._handoff_card(role)
+        return (f"共享状态卡（索引不足或与磁盘冲突时读取完整约束和验证证据）："
+                f"{self._journal.root / 'state.json'}\n"
+                f"完整计划：{self._journal.root / 'plan.json'}\n"
+                f"状态索引：\n{text}\n"
+                "按任务 ID 对接；已通过任务不重复实施。发现磁盘状态与记录不符时先核实。"
+                "引用仅表示可按需读取的位置，不代表内容已进入本次上下文；"
+                "索引超预算时按 segment_refs 分段读取。\n")
+
+    def _stable_prefix(self, role):
+        """稳定的角色指令前缀：不含时间、路径、任务 ID 或另一模型输出。"""
+        label = self._role_label(role)
+        return (
+            f"你是双 AI 协作系统中的「{label}」。\n"
+            f"协作档次：{self.tier} · {self.policy.label}（{self.policy.short}）。\n"
+            "通用规则：只做本轮任务范围，保持已确定接口；已完成且验证有效的成果直接复用；"
+            "不重放已提交的操作；不传递或推测另一个模型的内部思维链。\n"
+            "交接规则：只依据共享任务状态中的结论、决策依据、证据位置和未完成项；"
+            "引用只是可读取位置，不代表内容已加载；缺失、过期或冲突时先核实磁盘。\n"
+            "报告规则：最后一行 DUAL_RESULT 使用结构化 JSON；未执行、未验证或有未解决项的"
+            "任务必须标记 blocked/failed，不得把暂定判断写成已验证事实。\n")
+
+    def _mark_unconfirmed(self, role, label, call_ref, result, reason):
+        entry = {
+            "role": role, "label": label, "task_id": "",
+            "call_ref": call_ref, "reason": str(reason or "调用未确认成功")[:400],
+            "tool_count": len(result.tools or []),
+            "has_text": bool(result.text), "cancelled": bool(result.cancelled),
+            "requires_check": True,
+        }
+        self._unconfirmed.append(entry)
+        self._bump_revision("unconfirmed", entry["reason"], detail=entry)
+
+    def _can_switch(self):
+        with self._current_lock:
+            busy = self._current is not None
+        return not busy and not self._cancel.is_set()
+
+    def _record_switch(self, role, boundary, reason=""):
+        if not role or role == self._last_role:
+            self._last_role = role or self._last_role
+            return None
+        from_role = self._last_role
+        if not from_role:
+            # 首次角色分配不是“切换”，不制造切换成本。
+            self._last_role = role
+            return None
+        known_cache = {}
+        for item_role in (MASTER, WORKER):
+            stats = self._stats.get(item_role) or {}
+            known_cache[item_role] = {
+                "cache_hit_rate": stats.get("cache_hit_rate"),
+                "cache_measured_calls": stats.get("cache_measured_calls", 0),
+                "calls": stats.get("calls", 0),
+            }
+        requires_check = bool(self._unconfirmed)
+        allowed = self._can_switch()
+        entry = {
+            "from": from_role, "to": role, "boundary": boundary,
+            "allowed": allowed,
+            "deferred": not allowed,
+            "reason": reason or f"{from_role or '开始'} → {role}：{boundary}",
+            "known_cache_state": known_cache,
+            "handoff": self._last_handoff,
+            "handoff_revision": self._revision,
+            "reread_cost": "unknown",
+            "cost": None,
+            "requires_check": requires_check,
+            "quality_basis": "任务边界、产物落盘/结果返回；不因单轮简单而切换",
+        }
+        entry["revision"] = self._bump_revision(
+            "switch", entry["reason"], detail={"from": from_role, "to": role,
+                                               "boundary": boundary})
+        self._switches.append(entry)
+        self._last_role = role
+        self._last_switch_reason = entry["reason"]
+        self._save_state()
+        return entry
+
     def _run_agent(self, role, prompt, label, display=True, read_only=False,
-                   timeout=1200):
+                   timeout=1200, report_only=False):
         if self._cancel.is_set():
             return AgentResult(error="已取消", cancelled=True)
         spec = self._effort_for(self._spec_for(role))
         self._ensure_journal()
         # 角色隔离，即使同源同模型也不能互相恢复会话。
-        session_key = (role, spec.source, spec.model, spec.effort,
-                       str(Path(self.cwd).resolve()), self.permission_mode)
+        session_key = self._session_key(role)
         session_id = self._sessions.get(session_key, "")
         self._status_touch(label, role=role, task=label)
         if display:
             self.role_started.emit(role, label)
         agent = CliAgent(
             self.cwd, env=self.claude_env, claude_path=self.claude_path,
-            codex_path=self.codex_path, cancel_event=self._cancel,
-            timeout=timeout)
+            codex_path=self.codex_path, gemini_path=self.gemini_path,
+            cancel_event=self._cancel, timeout=timeout)
+        agent.report_only = report_only
         with self._current_lock:
             self._current = agent
 
@@ -1438,19 +2548,71 @@ class DualRunThread(QThread):
             stage_prompt += "\n" + RESULT_INSTRUCTION
             if role == WORKER and self._ask_count < self.policy.max_asks:
                 stage_prompt += "\n中途需要指导时以 DUAL_ASK 行代替最终交付；完成后才输出 DUAL_RESULT。\n"
+        stable_prefix = self._stable_prefix(role)
+
         def payload(resume):
-            return ("同一角色会话续接。共享状态卡是跨角色交接依据；请核实磁盘现状。\n"
-                    if resume else self._bootstrap(role)) + stage_prompt
+            if resume and session_key in self._started_keys:
+                dynamic = ("同一角色会话续接。共享状态卡是跨角色交接依据；请核实磁盘现状。\n")
+                self._pending_handoff = {
+                    "role": role, "mode": "role_session_resume", "revision": self._revision,
+                    "sent_revision": self._revision, "tokens_estimate": 0,
+                    "method": TOKEN_ESTIMATE_METHOD, "budget": self.handoff_token_budget,
+                    "trimmed": False, "overflow": False, "billable": False}
+            else:
+                dynamic = self._bootstrap(role, resumed=bool(resume))
+            return stable_prefix + dynamic + stage_prompt
+
         initial_payload = payload(bool(session_id))
+        handoff_meta = self._pending_handoff
+        self._pending_handoff = None
         self._prompt_chars += len(initial_payload)
+        tool_versions = {a.get("path"): a.get("version")
+                         for a in self._refresh_artifacts().values()}
+
+        def call_meta(handoff, result):
+            metrics = usage_metrics(spec.source, result.usage)
+            cost_source = "provider" if result.cost_usd is not None else None
+            if result.cost_usd is None and self.pricing is not None:
+                priced = price_usage(metrics, spec.model, self.pricing)
+                if priced is not None:
+                    result.cost_usd = priced
+                    cost_source = (f"pricing:{self.pricing.get('source')}@"
+                                   f"{self.pricing.get('version')}")
+                    self.note.emit("费用依据已提供且带版本的计费配置估算；非接口返回值。")
+            events = self._duplicate_tracker.observe(result.tools, tool_versions)
+            self._tool_call_count += len(result.tools or [])
+            duplicates = sum(1 for e in events if e.get("duplicate"))
+            self._duplicate_tool_calls += duplicates
+            self._necessary_rechecks += sum(1 for e in events if e.get("necessary_recheck"))
+            return {
+                "model": spec.model, "provider": spec.source, "kind": label,
+                "handoff": handoff, "switch_reason": self._last_switch_reason,
+                "token_method": "provider-usage" if result.usage else "unknown",
+                "cost_source": cost_source,
+                "cost_estimated": bool(cost_source and cost_source.startswith("pricing:")),
+                "duplicate_tool_calls": duplicates,
+                "necessary_rechecks": sum(1 for e in events if e.get("necessary_recheck")),
+                "summary_call": ("压缩" in label or "摘要" in label),
+                "tool_events": events[:40],
+            }
+
         try:
             result = agent.run(
                 spec, initial_payload, self.permission_mode, read_only,
                 on_delta, on_message, on_tool, session_id=session_id)
+            meta = call_meta(handoff_meta, result)
             self._account(role, result)
             if not result.ok and result.error:
                 self._status_fail(result.error)
-            self._last_call_path = self._journal.call(role, label, result, bool(session_id))
+            self._last_call_path = self._journal.call(
+                role, label, result, bool(session_id), spec.source, meta=meta)
+            if not result.ok or result.cancelled:
+                if result.tools or result.text:
+                    self._mark_unconfirmed(role, label, self._last_call_path, result,
+                                           result.error or "调用未确认成功")
+            elif handoff_meta:
+                self._ack[role] = max(self._ack.get(role, 0),
+                                      int(handoff_meta.get("sent_revision") or 0))
             # 只在明确的会话失效、没有执行输出时重建一次；普通错误不能重放写操作。
             stale = re.search(r"(?:no (?:conversation|session) found|"
                               r"(?:session|conversation|thread)[^\n]*(?:not found|does not exist))",
@@ -1461,14 +2623,26 @@ class DualRunThread(QThread):
                 self._session_resets += 1
                 self.note.emit("原角色会话已失效，使用完整状态卡重建会话（仅重试一次）。")
                 retry_payload = payload("")
+                retry_handoff = self._pending_handoff
+                self._pending_handoff = None
                 self._prompt_chars += len(retry_payload)
                 result = agent.run(
                     spec, retry_payload, self.permission_mode, read_only,
                     on_delta, on_message, on_tool, session_id="")
+                retry_meta = call_meta(retry_handoff, result)
                 self._account(role, result)
-                self._last_call_path = self._journal.call(role, label, result, False)
+                self._last_call_path = self._journal.call(
+                    role, label, result, False, spec.source, meta=retry_meta)
+                if result.ok and not result.cancelled and retry_handoff:
+                    self._ack[role] = max(self._ack.get(role, 0),
+                                          int(retry_handoff.get("sent_revision") or 0))
             if result.session_id and result.ok and not result.cancelled:
                 self._sessions[session_key] = result.session_id
+                self._started_keys.add(session_key)
+            elif not result.ok or result.cancelled:
+                self._sessions.pop(session_key, None)
+            if "压缩" in label or "摘要" in label:
+                self._summary_calls += 1
             self._save_state()
         finally:
             with self._current_lock:
@@ -1479,23 +2653,83 @@ class DualRunThread(QThread):
         stats = self._stats[role]
         stats["calls"] += 1
         stats["cost"] += float(result.cost_usd or 0)
+        stats["cost_known_calls"] = stats.get("cost_known_calls", 0) + (result.cost_usd is not None)
         stats["seconds"] += float(result.elapsed or 0)
-        for key, value in (result.usage or {}).items():
-            if key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens") and isinstance(value, (int, float)):
-                stats["tokens"] += int(value)
+        stats["tool_count"] = stats.get("tool_count", 0) + len(result.tools)
+        metrics = usage_metrics(self._spec_for(role).source, result.usage)
+        for key, value in metrics.items():
+            if key == "cache_hit_rate":
+                continue
+            if value is not None:
+                stats[key] = stats.get(key, 0) + value
+                known = key + "_known_calls"
+                stats[known] = stats.get(known, 0) + 1
+        if metrics["cache_hit_rate"] is not None:
+            stats["cache_measured_input"] = stats.get("cache_measured_input", 0) + metrics["input_tokens"]
+            stats["cache_measured_read"] = stats.get("cache_measured_read", 0) + metrics["cache_read_input_tokens"]
+            stats["cache_measured_calls"] = stats.get("cache_measured_calls", 0) + 1
+            stats["cache_hit_rate"] = stats["cache_measured_read"] / stats["cache_measured_input"]
+        stats["tokens"] = stats.get("input_tokens", 0) + stats.get("output_tokens", 0)
+        calls = max(1, stats.get("calls", 0))
+        stats["usage_coverage"] = round(stats.get("input_tokens_known_calls", 0) / calls, 4)
+        stats["cost_coverage"] = round(stats.get("cost_known_calls", 0) / calls, 4)
+        stats["cache_coverage"] = round(stats.get("cache_measured_calls", 0) / calls, 4)
+
+    def _measurement(self):
+        coverage = {}
+        for role in (MASTER, WORKER):
+            stats = self._stats.get(role) or {}
+            coverage[role] = {
+                "calls": stats.get("calls", 0),
+                "usage_coverage": stats.get("usage_coverage", 0.0),
+                "cost_coverage": stats.get("cost_coverage", 0.0),
+                "cache_coverage": stats.get("cache_coverage", 0.0),
+            }
+        return {
+            "token_counting": {
+                "usage": "provider-returned token fields only; missing fields stay unknown",
+                "handoff": estimate_tokens_label(),
+            },
+            "cost": {
+                "source": ("provider total_cost_usd when returned; otherwise verified "
+                           "pricing config with source/version; else unknown"),
+                "pricing_source": (self.pricing.get("source") if self.pricing else None),
+                "pricing_version": (self.pricing.get("version") if self.pricing else None),
+            },
+            "cache": ("cache_read_input_tokens / total input per role, model and provider; "
+                      "unknown stays null; no cross-model or cross-provider sharing assumed"),
+            "coverage": coverage,
+            "summary_calls": self._summary_calls,
+            "duplicate_tool_calls": self._duplicate_tool_calls,
+            "necessary_rechecks": self._necessary_rechecks,
+            "tool_calls_observed": self._tool_call_count,
+        }
 
     def _ensure_journal(self):
         if self._journal is None:
             self._journal = RunJournal(self.cwd, self.request, self.context, self.previous_state)
+            if self.context_delta is not None:
+                self._journal.write("context-delta.json", {"context": self.context_delta})
+            for role in (MASTER, WORKER):
+                key = self._session_key(role)
+                for row in self._resume_candidates:
+                    if (isinstance(row, dict) and row.get("key") == list(key)
+                            and isinstance(row.get("id"), str) and row["id"].strip()):
+                        self._sessions[key] = row["id"]
             if self._journal.previous_error:
                 self.note.emit(self._journal.previous_error)
+            self._bump_revision("run_started", "共享任务状态初始化")
             self._save_state()
 
     def _save_state(self):
         if self._journal is None:
             return
+        state = self._task_state()
         self._journal.write("state.json", {
-            "protocol_version": 3, "plan": self._plan,
+            "protocol_version": 4,
+            "revision": state["revision"],
+            "task_state": state,
+            "plan": self._plan,
             "review_enabled": self.review_enabled,
             "review_mode": self.review_mode,
             "previous_checkpoint": self._journal.previous,
@@ -1505,48 +2739,62 @@ class DualRunThread(QThread):
             "sessions": [{"role": k[0], "source": k[1], "model": k[2], "id": v}
                          for k, v in self._sessions.items()],
             "stats": self._stats,
+            "handoffs": self._handoff_log[-30:],
+            "acknowledged_revisions": dict(self._ack),
+            "switches": self._switches,
+            "unconfirmed_operations": self._unconfirmed,
+            "measurement": self._measurement(),
         })
 
-    def _bootstrap(self, role=""):
-        prior = (f"上轮交接快照：{self._journal.previous}，首次接手必须读取。\n"
-                 "沿用仍适用的接口、约束及未解决项；最新用户请求优先，已通过工作先核实再复用。\n"
+    def _bootstrap(self, role="", resumed=False):
+        self._ensure_journal()
+        brief = self._state_brief()
+        self._pending_handoff = {
+            "role": role, "mode": "resumed_bootstrap" if resumed else "bootstrap",
+            "revision": self._revision, "sent_revision": self._revision,
+            "tokens_estimate": estimate_tokens(brief), "method": TOKEN_ESTIMATE_METHOD,
+            "budget": self.handoff_token_budget, "trimmed": False,
+            "overflow": False, "billable": False,
+        }
+        if resumed:
+            context = self.context if self.context_delta is None else self.context_delta
+            if len(context) > self.CONTEXT_COMPRESS_THRESHOLD:
+                context = (self._compressed_context if role == MASTER and self._compressed_context else
+                           f"必须读取新增上下文：{self._journal.root / ('input.json' if self.context_delta is None else 'context-delta.json')}")
+            return (f"同一对话的新一轮请求（优先于旧任务）：\n{self.request}\n"
+                    f"项目目录：{self.cwd}\n共享状态卡：{self._journal.root / 'state.json'}\n"
+                    f"完整原始输入（缺项或冲突时核实）：{self._journal.root / 'input.json'}\n"
+                    f"任务状态：{brief}\n"
+                    f"新增上下文：\n{context or '（无，历史已在当前角色会话中）'}\n"
+                    "旧阶段指令已结束；按本轮权限、任务和约束继续，已完成工作不重做。\n")
+        prior = (f"上轮交接快照：{self._journal.previous}，首次接手按需核实。\n"
+                 "沿用仍适用的接口、约束及未解决项；最新用户请求优先，已通过工作先核实再复用；"
+                 "旧协议缺失字段保持未知。\n"
                  if self._journal.previous else self._journal.previous_error + "\n")
+        long_uncompressed = (len(self.context) > self.CONTEXT_COMPRESS_THRESHOLD
+                             and not self._compressed_context)
         if role == MASTER and self._compressed_context:
             input_rule = (
                 f"上下文摘要：{self._journal.root / 'context-brief.json'}\n"
                 f"完整原始输入（按需定位核实）：{self._journal.root / 'input.json'}\n"
-                "首次接手读取上下文摘要和共享状态卡，保留全部用户约束；"
+                "读取上下文摘要和共享状态卡，保留全部用户约束；"
                 "历史原文仅在摘要缺项、冲突或需要核实具体证据时按需定位读取。\n")
-        else:
+        elif long_uncompressed:
+            # 压缩失败或未压缩的长上下文必须核实原文，避免丢失关键约束。
             input_rule = (
                 f"完整原始输入：{self._journal.root / 'input.json'}\n"
                 "首次接手必须读取完整原始输入和共享状态卡，保留全部用户约束。\n")
+        else:
+            input_rule = (
+                f"完整原始输入（缺项或冲突时按需定位核实，不默认全量传递）："
+                f"{self._journal.root / 'input.json'}\n"
+                "共享状态卡是本轮交接依据；短上下文已附在下方，保留全部用户约束。\n")
         return (f"用户原始请求：\n{self.request}\n项目目录：{self.cwd}\n"
                 f"协作档次：{self.tier} · {self.policy.label}（{self.policy.short}）\n" + prior +
                 f"共享状态卡：{self._journal.root / 'state.json'}\n"
+                f"任务状态：{brief}\n"
                 + input_rule +
                 "最近对话上下文：\n" + self._context_block(role) + "\n")
-
-    def _state_block(self):
-        self._ensure_journal()
-        self._save_state()
-        card = {"summary": self._plan.get("summary", ""),
-                "constraints": self._plan.get("constraints", []),
-                "tasks": [{"id": t["id"], "title": t["title"], "role": t["role"]}
-                          for t in self._plan.get("tasks", [])],
-                "handoffs": [{k: v for k, v in r.items() if k != "text"}
-                             for r in self._records]}
-        serialized = json.dumps(card, ensure_ascii=False)
-        if len(serialized) > 12000:
-            # 大报告留在文件；发送完整有效的索引，不把 JSON 切成不完整片段。
-            serialized = json.dumps({"summary": self._plan.get("summary", ""),
-                "tasks": card["tasks"], "handoffs": [
-                    {k: r[k] for k in ("id", "ok", "error", "report_path") if k in r}
-                    for r in self._records]}, ensure_ascii=False)
-        return (f"共享状态卡（必须读取，含完整约束、接口决定和验证证据）：{self._journal.root / 'state.json'}\n"
-                f"完整计划：{self._journal.root / 'plan.json'}\n"
-                f"状态索引：\n{serialized}\n"
-                "按任务 ID 对接；已通过任务不重复实施。发现磁盘状态与记录不符时先核实。\n")
 
     # --------------------------------------------------------------- prompts --
     def _context_block(self, role=""):
@@ -1617,6 +2865,9 @@ think 思考决策 / design 方案设计 / execute 执行修改 / monitor 运行
 
 规则：
 - 任务按执行顺序排列；相邻同角色任务会合并调用。
+- 已定位且足够的证据直接复用；不要把规划已完成的调查再拆给另一个模型。
+- 简单任务可只含一个执行任务；不要为调用第二个模型制造工作。
+- constraints 只保留跨阶段用户约束；本次规划的只读限制不要误写成后续执行禁令。
 - 只按“谁做更省且更稳”分配：高档工作（思考/设计/疑难）给 master，
   低档工作（读取/检索/执行/监控）给 worker；不要再安排重复汇报或独立交接任务。
 {review_rule}- 不要为了贴占比而增减任务；任务总数不超过 8 个。
@@ -1665,9 +2916,10 @@ think 思考决策 / design 方案设计 / execute 执行修改 / monitor 运行
         ask_rule = ""
         if role == WORKER and self._ask_count < self.policy.max_asks:
             ask_rule = ("- 需要主 AI 决策时，只输出一行压缩询问后停止：\n"
-                        '  DUAL_ASK: {"task":"当前任务 ID","problem":"一句话","need":"需要的决定","tried":["已试"]}\n')
+                        '  DUAL_ASK: {"task":"当前任务 ID","problem":"一句话","need":"需要的决定","tried":["已试"],"completed":[]}\n'
+                        "- completed 可携带已完成的连续前序任务的完整逐项报告和验证证据，避免询问后重做。\n")
         return f"""你是双 AI 协作系统中的「{label}」。档次 {self.tier} · {self.policy.short}。
-{self._state_block()}
+{self._state_block(role)}
 当前任务包：
 {json.dumps(compact, ensure_ascii=False)}
 
@@ -1681,9 +2933,13 @@ tier={self.tier}; role={role}; ops={self._ops_text(tasks[0].get("ops"))}
 """
 
     def _compress_prompt(self):
+        source = (self._journal.root / 'context-delta.json'
+                  if self._session_key(MASTER) in self._sessions and self.context_delta is not None
+                  else self._journal.root / 'input.json')
         return f"""你是执行 AI。先为下一个角色压缩有效上下文，节省主 AI 输入额度。
 
 项目目录：{self.cwd}
+压缩源：读取 {source} 的 context 字段。已有主 AI 会话时仅压缩新增内容，历史约束仍保留在原会话。
 只读操作；不要修改任何文件。只输出一个 JSON 对象：
 {{"summary":"目标与现状（≤400字）","constraints":["必须保留的约束/接口"],
  "refs":["关键文件:行号或路径"],"risks":["风险或未知项"]}}
@@ -1710,14 +2966,72 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
 {guide}
 
 原询问：{json.dumps(ask, ensure_ascii=False)}
-按指导继续原任务包，不要扩大范围。完成后按交付协议输出 DUAL_RESULT。
+当前任务包：
+{json.dumps(tasks, ensure_ascii=False)}
+
+已确认的成功前缀已从任务包移除；只续做上述剩余 ID，不重做或重复报告已通过项。
+按指导继续，不要扩大范围。完成后按交付协议输出 DUAL_RESULT。
 本轮剩余询问次数：{max(0, self.policy.max_asks - self._ask_count)}；用尽后仍有阻塞则报告 blocked。
 """
+
+    def _ask_prefix(self, tasks, ask):
+        """Accept only a contiguous, verified prefix before the task asking for help."""
+        items = ask.get("completed")
+        if not isinstance(items, list) or not items or len(items) >= len(tasks):
+            return []
+        if ([item.get("id") if isinstance(item, dict) else None for item in items]
+                != [task["id"] for task in tasks[:len(items)]]):
+            return []
+        if ask["task"] not in {t["id"] for t in tasks[len(items):]}:
+            return []
+        if not all(valid_report(item) and item["status"] == "passed" and not item.get("open_issues")
+                   for item in items):
+            return []
+        return items
+
+    def _repair_result(self, role, tasks, result):
+        """One read-only report repair; never retry a failed transport or replay implementation."""
+        if not result.ok or result.cancelled or result.error or self._cancel.is_set():
+            return result
+        raw = _last_prefixed_json(result.text, "DUAL_RESULT:")
+        if not raw or raw.get("status") != "passed" or raw.get("open_issues"):
+            return result
+        items = raw.get("tasks")
+        expected = [t["id"] for t in tasks]
+        if items is not None:
+            if not isinstance(items, list):
+                return result
+            ids = [item.get("id") if isinstance(item, dict) else None for item in items]
+            if ids != expected[:len(items)] or any(
+                    item.get("status") != "passed" or item.get("open_issues") for item in items):
+                return result
+        reports = self._task_reports(tasks, result)
+        if all(item["status"] == "passed" for item in reports):
+            return result
+        original_path = self._last_call_path
+        self._report_repairs += 1
+        self.note.emit("交付报告缺项：先只读补报一次，不重做实施或验证命令。")
+        repaired = self._run_agent(role,
+            "仅补齐已执行工作的交付报告，禁止执行工具、修改文件、重跑测试或重新实施。\n"
+            "只能引用当前会话和原报告已有的实际验证证据；没有证据的项必须 blocked。\n"
+            "不得把明确失败、未执行或留待用户执行的操作改称已完成。\n"
+            f"按顺序报告全部 ID：{json.dumps(expected)}。保留已有效的成功前缀内容。\n"
+            f"原始调用记录：{original_path or '见下方原报告'}\n原报告：\n{result.text}\n"
+            "最后一行 DUAL_RESULT 必须有 status、summary、非空 verification 和逐项 tasks。",
+            f"{self._role_label(role)} · 补报 {','.join(expected)}",
+            display=False, read_only=True, timeout=self.GUIDE_TIMEOUT, report_only=True)
+        fixed = self._task_reports(tasks, repaired)
+        if all(item["status"] == "passed" for item in fixed) and all(
+                old["status"] != "passed" or old == new for old, new in zip(reports, fixed)):
+            return repaired
+        # Failed repair cannot erase the original verified prefix.
+        self._last_call_path = original_path
+        return result
 
     def _takeover_prompt(self, plan, task, failed_result):
         reason = failed_result.error or self._records[-1].get("report", {}).get("summary") or "执行 AI 未能给出可用结果"
         return f"""你是主 AI（M）。执行 AI 未能完成任务 {task['id']}，现在由你接管。
-{self._state_block()}
+{self._state_block(MASTER)}
 当前任务：{json.dumps(task, ensure_ascii=False)}
 完整失败记录：{self._last_call_path or '见共享状态卡'}
 失败原因：{reason}
@@ -1734,7 +3048,7 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                   "检查实际代码和验证结果，修复未达标之处。只改必要内容。")
         return f"""你是主 AI（M），负责最终验收。
 
-{self._state_block()}
+{self._state_block(MASTER)}
 
 {action}
 逐项检查完整计划和原始约束，包括未执行任务及未解决项，不能仅相信先前摘要。
@@ -1787,6 +3101,9 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                   "ok": report["status"] == "passed", "report": report,
                   "text": report["summary"], "error": result.error if not result.ok else "",
                   "report_path": self._last_call_path}
+        record["revision"] = self._bump_revision(
+            "record", f"{task['id']} {report['status']}: {report.get('summary', '')}"[:300],
+            task_id=task["id"])
         self._records.append(record)
         self._save_state()
         return record
@@ -1813,7 +3130,9 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                 return
 
             # 1) 长上下文先由执行 AI 压缩，主 AI 只读压缩结果。
-            if policy.precompress and len(self.context) > self.CONTEXT_COMPRESS_THRESHOLD:
+            compress_context = (self.context_delta if self._session_key(MASTER) in self._sessions
+                                and self.context_delta is not None else self.context)
+            if policy.precompress and len(compress_context) > self.CONTEXT_COMPRESS_THRESHOLD:
                 self._emit_status("执行 AI 正在压缩上下文…", role=WORKER)
                 comp = self._run_agent(
                     WORKER, self._compress_prompt(), "执行 AI · 上下文压缩",
@@ -1831,7 +3150,7 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                         key: data[key] for key in ("summary", "constraints", "refs", "risks")
                     }
                     serialized = json.dumps(compact, ensure_ascii=False)
-                    if len(serialized) < len(self.context):
+                    if len(serialized) < len(compress_context):
                         self._journal.write("context-brief.json", compact)
                         self._compressed_context = serialized
                 if self._compressed_context:
@@ -1844,6 +3163,9 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
             # 2) 主 AI 规划/契约
             contract = self.policy.plan_style == "contract"
             plan_label = "主 AI · 契约" if contract else "主 AI · 规划"
+            self._resume_point = "规划阶段"
+            self._record_switch(MASTER, "规划/契约开始（上下文压缩结果已落盘）" if
+                                self._compressed_context else "规划/契约开始")
             self._emit_status("主 AI 正在下发契约…" if contract else "主 AI 正在规划…", role=MASTER)
             plan_result = self._run_agent(
                 MASTER, self._plan_prompt(), plan_label,
@@ -1863,6 +3185,11 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                                   review_enabled=self.review_enabled)
             self._plan = plan
             self._journal.write("plan.json", plan)
+            self._task_total = len(plan.get("tasks") or [])
+            self._resume_point = (f"已规划 {self._task_total} 项任务，等待执行"
+                                  if self._task_total else "已规划，无独立任务")
+            self._bump_revision("plan", plan.get("summary", "计划已落盘"),
+                                detail={"tasks": [t.get("id") for t in plan.get("tasks", [])]})
             self._save_state()
             self.plan_ready.emit(plan)
             if self._cancel.is_set():
@@ -1883,6 +3210,10 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                     end += 1
                 batch = tasks[index:end]
                 label = f"{self._role_label(role)} · {','.join(t['id'] for t in batch)}"
+                self._task_index = index
+                self._resume_point = (f"任务 {index + 1}/{len(tasks)}"
+                                      f"（{','.join(t['id'] for t in batch)}）")
+                self._record_switch(role, "任务包开始（前序结果已返回并落盘）")
                 self._emit_status(
                     f"正在执行 {index + 1}—{end}/{len(tasks)}（{self._role_label(role)}）",
                     role=role, task=",".join(t["id"] for t in batch))
@@ -1897,11 +3228,20 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                 batch_ids = {t["id"] for t in batch}
                 while (ask and ask["task"] in batch_ids
                        and self._ask_count < self.policy.max_asks):
+                    prefix = self._ask_prefix(batch, ask)
+                    for finished_task, finished_report in zip(batch, prefix):
+                        self._work_points[role] += finished_task["points"]
+                        self._record(finished_task, finished_report, result)
+                        index += 1
+                    batch = batch[len(prefix):]
+                    batch_ids = {t["id"] for t in batch}
+                    ask = dict(ask, completed=[])
                     self._ask_count += 1
                     ids = ",".join(t["id"] for t in batch)
                     self.note.emit(
                         f"执行 AI 询问 {ask['task'] or ids}：{ask['problem'][:120]}"
                         " → 主 AI 二次指导")
+                    self._record_switch(MASTER, "执行 AI 已返回询问，工具结果已返回")
                     guide_result = self._run_agent(
                         MASTER, self._guide_prompt(plan, batch, ask),
                         f"主 AI · 指导 {ask['task'] or ids}", display=False,
@@ -1916,6 +3256,7 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                         break
                     self._emit_status(f"执行 AI 依据指导继续 {ids}…",
                                      role=WORKER, task=ids)
+                    self._record_switch(WORKER, "主 AI 指导已返回，继续未完成任务")
                     result = self._run_agent(
                         role, self._followup_prompt(batch, ask, guide),
                         f"{self._role_label(role)} · {ids}（续）",
@@ -1924,6 +3265,10 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                         self._finish_cancelled(plan)
                         return
                     ask = extract_ask(result)
+                result = self._repair_result(role, batch, result)
+                if self._cancel.is_set() or result.cancelled:
+                    self._finish_cancelled(plan)
+                    return
                 reports = self._task_reports(batch, result)
                 for task, report in zip(batch, reports):
                     self._work_points[role] += task["points"]
@@ -1934,6 +3279,10 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                 if not record["ok"] and role == WORKER:
                     self.note.emit(
                         f"执行 AI 未完成 {task['id']}，按完成优先规则由主 AI 接管。")
+                    self._record_switch(
+                        MASTER, "执行失败已停止；先核对未确认操作再接管",
+                        reason=(f"执行 AI 未完成 {task['id']}，结果已返回；"
+                                "恢复前必须核对未确认操作"))
                     takeover = self._run_agent(
                         MASTER, self._takeover_prompt(plan, task, result),
                         f"主 AI · 接管 {task['id']}", display=True,
@@ -1978,6 +3327,8 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
                 self.note.emit(
                     f"档次 {self.tier}：全部任务通过，跳过主 AI 验收调用以节省额度。")
             if not self._cancel.is_set() and needs_review:
+                self._resume_point = "验收阶段"
+                self._record_switch(MASTER, "全部任务结果已落盘，进入验收")
                 self._emit_status("主 AI 正在验收…", role=MASTER)
                 review = self._run_agent(
                     MASTER, self._review_prompt(plan, self._records),
@@ -2079,7 +3430,7 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
             item["source"] = self._spec_for(role).source
             stats[role] = item
         info = {
-            "ok": (not cancelled and bool(self._records)
+            "ok": (not cancelled and not self._unconfirmed and bool(self._records)
                    and all(any(r["id"] == t["id"] and r.get("ok") for r in self._records)
                            for t in plan.get("tasks", []))
                    and (self._review_ok is True or (self._review_ok is None
@@ -2110,9 +3461,27 @@ DUAL_GUIDE: {{"decision":"结论","next":["下一步动作"],"avoid":["禁忌"],
             "stats": stats,
             "endpoint": plan.get("endpoint", False),
             "solo": bool(self.policy.solo_role),
-            "protocol_version": 3,
+            "protocol_version": 4,
+            "revision": self._revision,
             "state_dir": str(self._journal.root) if self._journal else "",
             "session_resets": self._session_resets,
+            "session_state": self._export_sessions(),
+            "report_repairs": self._report_repairs,
+            "handoffs": self._handoff_log[-30:],
+            "acknowledged_revisions": dict(self._ack),
+            "handoff_tokens": sum(int(item.get("tokens_estimate") or 0)
+                                  for item in self._handoff_log),
+            "handoff_method": TOKEN_ESTIMATE_METHOD,
+            "handoff_budget": self.handoff_token_budget,
+            "switches": self._switches,
+            "switch_count": len(self._switches),
+            "summary_calls": self._summary_calls,
+            "duplicate_tool_calls": self._duplicate_tool_calls,
+            "necessary_rechecks": self._necessary_rechecks,
+            "tool_calls_observed": self._tool_call_count,
+            "unconfirmed_operations": self._unconfirmed,
+            "measurement": self._measurement(),
+            "task_state": self._task_state(),
         }
         self._save_state()
         if self._journal:

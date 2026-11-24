@@ -3,6 +3,7 @@
 """Claude 控制台 —— 在桌面窗口中与 Claude Code 对话。"""
 
 import asyncio
+import copy
 import difflib
 import html
 import json
@@ -104,6 +105,8 @@ DEFAULT_CONFIG = {
     "geometry": "",
     "permission_mode": "default",
     "model": "",
+    # 单模型来源：claude（服务商 SDK）| codex | gemini（登录 CLI）
+    "model_source": "",
     "effort": "high",
     # 双 AI 协作：主 AI / 执行 AI 的模型与协作档次
     "dual_mode": False,
@@ -839,9 +842,10 @@ def tool_summary(name, data):
 # 模型目录后台线程
 # --------------------------------------------------------------------------- #
 class ModelCatalogWorker(QThread):
-    """在后台请求服务商的 /models，避免阻塞界面。"""
+    """在后台请求服务商的 /models，并预取 Gemini 登录模型。"""
 
     loaded = pyqtSignal(object, str)
+    extras_loaded = pyqtSignal(object)
 
     def run(self):
         try:
@@ -850,6 +854,13 @@ class ModelCatalogWorker(QThread):
             self.loaded.emit([], str(exc))
         else:
             self.loaded.emit(models, "")
+        try:
+            extras = {"gemini": dual_ai.load_gemini_models(refresh=True),
+                      "gemini_auth": dual_ai.gemini_auth_state(),
+                      "gemini_binary": dual_ai.find_gemini_binary()}
+        except Exception:  # noqa: BLE001 - 目录失败不应影响主流程
+            extras = {"gemini": [], "gemini_auth": "", "gemini_binary": ""}
+        self.extras_loaded.emit(extras)
 
 
 # --------------------------------------------------------------------------- #
@@ -904,6 +915,7 @@ class ClaudeWorker(QObject):
         self._last_permission_tool = ""
         self._last_permission_time = None
         self._last_error = ""
+        self._reported_sessions = set()
 
     # ------------------------------------------------------------- threading --
     def start(self):
@@ -1195,14 +1207,28 @@ class ClaudeWorker(QObject):
 
         if isinstance(message, ResultMessage):
             self._status_touch("已返回结果")
-            self.result.emit({
+            usage = getattr(message, "usage", None) or {}
+            sid = message.session_id
+            info = {
                 "session_id": message.session_id,
                 "is_error": bool(message.is_error),
                 "result": message.result or "",
                 "cost": message.total_cost_usd,
                 "duration": message.duration_ms,
                 "subtype": message.subtype,
-            })
+                "model": self._model or "",
+                "usage": usage, "metrics": dual_ai.usage_metrics("claude", usage),
+                "model_usage": getattr(message, "model_usage", None) or {},
+                "tool_count": self._tool_count,
+                "elapsed": time.monotonic() - self._turn_started if self._turn_started else None,
+                "resumed": bool(self._resume or sid in self._reported_sessions),
+            }
+            self._reported_sessions.add(sid)
+            try:
+                info["usage_path"] = dual_ai.record_single_usage(info)
+            except OSError as exc:
+                info["usage_log_error"] = str(exc)
+            self.result.emit(info)
 
     # ------------------------------------------------------------- permission --
     def set_dev_policy(self, roots, mode):
@@ -7600,6 +7626,7 @@ class MainWindow(QMainWindow):
         self._permission_mode = saved_mode
         self._last_perm_index = 0
         self._model = self.config.get("model") or default_model_choice()
+        self._model_source = self.config.get("model_source") or "claude"
         self._effort = self.config.get("effort") or "high"
         if not isinstance(self._effort, str) or not self._effort.strip():
             self._effort = "high"
@@ -7632,6 +7659,9 @@ class MainWindow(QMainWindow):
         self._balance_watch.start()
         # 从服务商自动获取的模型目录：{模型 ID: {name, efforts, ...}}
         self._model_catalog = {m["id"]: dict(m) for m in FALLBACK_MODELS}
+        self._gemini_auth = ""
+        self._gemini_binary = ""
+        self._gemini_mtime = dual_ai.gemini_settings_mtime()
         self._catalog_thread = None
         self._catalog_loaded = False
         self._pending_catalog = None
@@ -7745,6 +7775,12 @@ class MainWindow(QMainWindow):
             "session_id": None,
             "cwd": None,
             "needs_reconfigure": True,
+            # None 表示使用工作默认配置；dict 表示仅当前对话的覆盖配置。
+            "model_config_override": None,
+            # “仅本次对话”勾选状态，新对话默认勾选。
+            "model_config_scoped": True,
+            "dual_session_state": [],
+            "dual_history_cursor": 0,
             "study_pending": False,
             "study_goal": "",   # 后台研读请求的目标，回答归档时用
             "tab": "chat",      # 该项目上次停留的主页签（对话/研读/历史…）
@@ -8193,8 +8229,9 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.setMinimumWidth(190)
         self.model_combo.setToolTip(
-            "模型列表从当前服务商自动获取（cc-switch 的 settings.json）。\n"
-            "切换后会重建会话，并保留当前对话的上下文。")
+            "模型来源：Claude 服务商（cc-switch 的 settings.json）、"
+            "Codex 登录模型、Gemini 登录模型。\n"
+            "Claude 走 SDK；Codex / Gemini 走各自命令行非交互执行。")
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
         single.addWidget(self.model_combo)
         effort_label = QLabel("思考")
@@ -8205,13 +8242,30 @@ class MainWindow(QMainWindow):
         self.effort_combo.setToolTip("思考档位，随所选模型支持的档位变化")
         self.effort_combo.currentIndexChanged.connect(self._on_effort_changed)
         single.addWidget(self.effort_combo)
+        self.single_change_check = QCheckBox("仅本次对话")
+        self.single_change_check.setToolTip(
+            "默认勾选：修改只作用于当前对话，新建对话后恢复工作默认配置。\n"
+            "取消勾选：修改会保存为所有项目使用的工作默认配置。")
+        self.single_change_check.setChecked(True)
+        self.single_change_check.toggled.connect(self._on_single_change_toggled)
+        config_row.addWidget(self.single_change_check)
+
+        self.dual_check = QCheckBox("双 AI 协作")
+        self.dual_check.setToolTip(
+            "主 AI 负责规划、疑难处理和验收，执行 AI 负责范围内实现。\n"
+            "此项也受“仅本次对话”控制。")
+        self.dual_check.setChecked(bool(self.config.get("dual_mode")))
+        self.dual_check.toggled.connect(self._on_dual_toggled)
+        config_row.addWidget(self.dual_check)
+
         config_row.addWidget(self.single_model_panel)
         self._build_dual_panel(config_row)
 
         self.btn_refresh_models = QToolButton()
         self.btn_refresh_models.setText("↻")
         self.btn_refresh_models.setObjectName("Small")
-        self.btn_refresh_models.setToolTip("重新获取服务商和 Codex 模型及思考档位")
+        self.btn_refresh_models.setToolTip(
+            "重新获取 Claude 服务商、Codex 与 Gemini 登录模型及思考档位")
         self.btn_refresh_models.clicked.connect(self._refresh_model_catalog)
         config_row.addWidget(self.btn_refresh_models)
         config_row.addStretch(1)
@@ -8255,14 +8309,7 @@ class MainWindow(QMainWindow):
         self.btn_progress.clicked.connect(self._show_progress_popup)
         bottom.addWidget(self.btn_progress)
         bottom.addStretch(1)
-        # 底栏顺序：双 AI 协作开关 → 模型配置按钮 → 额度显示 → 停止 → 发送。
-        self.dual_check = QCheckBox("双 AI 协作")
-        self.dual_check.setToolTip(
-            "主 AI 负责规划、疑难处理和验收，执行 AI 负责范围内实现。\n"
-            "主 AI 占比 0 / 100 时仅调用一个角色。")
-        self.dual_check.setChecked(bool(self.config.get("dual_mode")))
-        self.dual_check.toggled.connect(self._on_dual_toggled)
-        bottom.addWidget(self.dual_check)
+        # 底栏保留模型配置入口；双 AI 开关已经移入展开后的模型配置栏。
         self.btn_model_config = QPushButton("模型配置 ▾")
         self.btn_model_config.setObjectName("Flat")
         self.btn_model_config.setCheckable(True)
@@ -9445,6 +9492,100 @@ class MainWindow(QMainWindow):
         return worker
 
     # ------------------------------------------------------ 双 AI 协作面板 --
+    def _model_config_values(self):
+        """返回当前控件对应的完整模型配置快照。"""
+        return {
+            "model": self._model,
+            "model_source": self._model_source,
+            "effort": self._effort,
+            "dual_mode": bool(getattr(self, "dual_check", None)
+                              and self.dual_check.isChecked()),
+            "dual_master": self._dual_master.to_dict(),
+            "dual_worker": self._dual_worker.to_dict(),
+            "dual_tier": self._dual_tier,
+            "dual_review_enabled": bool(
+                getattr(self, "review_check", None)
+                and self.review_check.isChecked()),
+        }
+
+    def _store_model_config(self, key, value):
+        """按“仅本次对话”开关写入对话覆盖或工作默认配置。"""
+        if getattr(self, "_restoring_model_config", False):
+            return
+        state = self._chat_state()
+        scoped = bool(getattr(self, "single_change_check", None)
+                      and self.single_change_check.isChecked())
+        if scoped:
+            override = state.get("model_config_override")
+            if not isinstance(override, dict):
+                override = self._model_config_values()
+                state["model_config_override"] = override
+            override[key] = copy.deepcopy(value)
+        else:
+            self.config[key] = copy.deepcopy(value)
+            save_config(self.config)
+
+    def _apply_model_config(self, values, scoped=False):
+        """把工作默认值或当前对话覆盖值无副作用地恢复到控件。"""
+        values = values if isinstance(values, dict) else self.config
+        self._restoring_model_config = True
+        try:
+            self._model = str(values.get("model") or default_model_choice())
+            self._model_source = str(values.get("model_source") or "claude")
+            self._effort = str(values.get("effort") or "high")
+            self._dual_master = dual_ai.RoleSpec.from_dict(
+                values.get("dual_master"), "claude")
+            self._dual_worker = dual_ai.RoleSpec.from_dict(
+                values.get("dual_worker"), "codex")
+            self._dual_tier = dual_ai.normalize_tier(
+                values.get("dual_tier") or dual_ai.L2)
+
+            self._populate_model_combo(self._model, self._model_source)
+            self._populate_dual_combos()
+            for widget, value in (
+                    (self.dual_check, bool(values.get("dual_mode"))),
+                    (self.review_check,
+                     bool(values.get("dual_review_enabled", True)))):
+                widget.blockSignals(True)
+                widget.setChecked(value)
+                widget.blockSignals(False)
+            self.dual_tier_combo.blockSignals(True)
+            index = self.dual_tier_combo.findData(self._dual_tier)
+            self.dual_tier_combo.setCurrentIndex(max(0, index))
+            self.dual_tier_combo.blockSignals(False)
+            self.single_change_check.blockSignals(True)
+            self.single_change_check.setChecked(bool(scoped))
+            self.single_change_check.blockSignals(False)
+        finally:
+            self._restoring_model_config = False
+        self._update_dual_controls()
+        if self.current_project and self._model_source == "claude":
+            self.worker.set_model(self._model, resume=self._chat_resume_id)
+            self.worker.set_effort(self._effort, resume=self._chat_resume_id)
+        self._sync_study_runtime(effort=self._effort)
+
+    def _restore_model_config_for_chat(self):
+        state = self._chat_state()
+        override = state.get("model_config_override")
+        scoped = bool(isinstance(override, dict)
+                      or state.get("model_config_scoped", True))
+        self._apply_model_config(
+            override if isinstance(override, dict) else self.config,
+            scoped=scoped)
+
+    def _on_single_change_toggled(self, checked):
+        state = self._chat_state()
+        state["model_config_scoped"] = bool(checked)
+        if checked:
+            state["model_config_override"] = self._model_config_values()
+            self.statusBar().showMessage(
+                "已切为仅本次对话：之后的模型配置不会改动工作默认值", 4000)
+            return
+        state["model_config_override"] = None
+        self._apply_model_config(self.config, scoped=False)
+        self.statusBar().showMessage(
+            "已恢复工作默认配置；之后的修改将用于所有项目", 4000)
+
     def _build_dual_panel(self, layout):
         # 与单模型组共用原模型位置；整个组隐藏后标签也不占空间。
         self.dual_panel = QWidget()
@@ -9494,7 +9635,8 @@ class MainWindow(QMainWindow):
             row.addWidget(title)
             combo = QComboBox()
             combo.setFixedWidth(165)
-            combo.setToolTip(label + "模型：支持 Claude 服务商与 Codex 登录模型")
+            combo.setToolTip(
+                label + "模型：支持 Claude 服务商、Codex 与 Gemini 登录模型")
             combo.currentIndexChanged.connect(handler)
             setattr(self, "dual_" + role + "_combo", combo)
             row.addWidget(combo)
@@ -9565,6 +9707,17 @@ class MainWindow(QMainWindow):
             combo.addItem(name, {"source": "codex", "model": model_id,
                                  "name": name, "efforts": meta.get("efforts") or [],
                                  "default_effort": meta.get("default_effort")})
+        gemini_models = dual_ai.peek_gemini_models()
+        if gemini_models:
+            header("── Gemini 登录模型"
+                   + ("" if self._gemini_auth else "（未登录）") + " ──")
+            for meta in gemini_models:
+                model_id = str(meta.get("id") or "")
+                name = "Gemini · " + str(meta.get("name") or model_id)
+                combo.addItem(name, {"source": "gemini", "model": model_id,
+                                     "name": name, "efforts": [],
+                                     "default_effort": "",
+                                     "context": meta.get("context")})
 
         target_source = current.source if isinstance(
             current, dual_ai.RoleSpec) else "claude"
@@ -9592,10 +9745,12 @@ class MainWindow(QMainWindow):
             # 已保存过来源时尊重它；只有从未选择过才用默认来源。
             # 默认：主 AI 跟随当前 Claude 模型，执行 AI 用 Codex 登录模型。
             source = target_source if target_source in (
-                "claude", "codex") else default_source
+                "claude", "codex", "gemini") else default_source
             if source == "codex":
                 fallback = dual_ai.default_codex_model()
                 wanted = ("codex", fallback["id"] if fallback else "")
+            elif source == "gemini" and gemini_models:
+                wanted = ("gemini", str(gemini_models[0].get("id") or ""))
             else:
                 wanted = ("claude", target_model or self._model)
             for index in range(combo.count()):
@@ -9615,7 +9770,6 @@ class MainWindow(QMainWindow):
     def _populate_dual_combos(self):
         if not hasattr(self, "dual_master_combo"):
             return
-        changed = False
         for role, source in (("master", "claude"), ("worker", "codex")):
             current = getattr(self, "_dual_" + role)
             # 旧配置首次迁移时，主模型跟随单模型（包括尚未加载的自定义模型）。
@@ -9635,11 +9789,10 @@ class MainWindow(QMainWindow):
                 spec.effort = current.effort
             setattr(self, "_dual_" + role, spec)
             key = "dual_" + role
-            if self.config.get(key) != spec.to_dict():
-                self.config[key] = spec.to_dict()
-                changed = True
-        if changed:
-            save_config(self.config)
+            current_saved = (self._chat_state().get("model_config_override") or
+                             self.config).get(key)
+            if current_saved != spec.to_dict():
+                self._store_model_config(key, spec.to_dict())
         self._update_dual_controls()
 
     @staticmethod
@@ -9680,8 +9833,7 @@ class MainWindow(QMainWindow):
     def _on_dual_effort_changed(self, role):
         spec = self._dual_spec_from_combo(role)
         setattr(self, "_dual_" + role, spec)
-        self.config["dual_" + role] = spec.to_dict()
-        save_config(self.config)
+        self._store_model_config("dual_" + role, spec.to_dict())
 
     def _set_combo_to_spec(self, combo, spec):
         combo.blockSignals(True)
@@ -9695,8 +9847,7 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
     def _on_dual_toggled(self, checked):
-        self.config["dual_mode"] = bool(checked)
-        save_config(self.config)
+        self._store_model_config("dual_mode", bool(checked))
         self._update_chat_buttons()
         # 切换模式后按新模式刷新底栏额度；5 分钟内的缓存可直接复用，
         # 过期结果会在 _refresh_balance 中重新查询。
@@ -9715,8 +9866,7 @@ class MainWindow(QMainWindow):
         if not spec.model:
             return
         self._dual_master = spec
-        self.config["dual_master"] = spec.to_dict()
-        save_config(self.config)
+        self._store_model_config("dual_master", spec.to_dict())
         self._update_dual_controls()
         self._refresh_balance("master", force=True)
         self.statusBar().showMessage(f"主 AI：{spec.label}", 2500)
@@ -9727,8 +9877,7 @@ class MainWindow(QMainWindow):
         if not spec.model:
             return
         self._dual_worker = spec
-        self.config["dual_worker"] = spec.to_dict()
-        save_config(self.config)
+        self._store_model_config("dual_worker", spec.to_dict())
         self._update_dual_controls()
         self._refresh_balance("worker", force=True)
         self.statusBar().showMessage(f"执行 AI：{spec.label}", 2500)
@@ -9742,9 +9891,8 @@ class MainWindow(QMainWindow):
         self._populate_dual_effort("worker", master.effort)
         self._dual_master = self._dual_spec_from_combo("master")
         self._dual_worker = self._dual_spec_from_combo("worker")
-        self.config["dual_master"] = self._dual_master.to_dict()
-        self.config["dual_worker"] = self._dual_worker.to_dict()
-        save_config(self.config)
+        self._store_model_config("dual_master", self._dual_master.to_dict())
+        self._store_model_config("dual_worker", self._dual_worker.to_dict())
         self._update_dual_controls()
         self._refresh_balances()
         self.statusBar().showMessage(
@@ -9752,8 +9900,7 @@ class MainWindow(QMainWindow):
             f"执行 AI = {self._dual_worker.label}", 3500)
 
     def _on_dual_review_toggled(self, checked):
-        self.config["dual_review_enabled"] = bool(checked)
-        save_config(self.config)
+        self._store_model_config("dual_review_enabled", bool(checked))
         self.statusBar().showMessage(
             "主 AI 复查已开启：按当前协作档次执行验收策略"
             if checked else
@@ -9763,8 +9910,7 @@ class MainWindow(QMainWindow):
     def _on_dual_tier_changed(self, _index):
         tier = self.dual_tier_combo.currentData() or dual_ai.L2
         self._dual_tier = dual_ai.normalize_tier(tier)
-        self.config["dual_tier"] = self._dual_tier
-        save_config(self.config)
+        self._store_model_config("dual_tier", self._dual_tier)
         policy = dual_ai.tier_policy(self._dual_tier)
         self._update_dual_controls()
         self.statusBar().showMessage(
@@ -9820,7 +9966,14 @@ class MainWindow(QMainWindow):
     def _balance_spec(self, role):
         """取某余额角色当前对应的模型；single 用单模型下拉框。"""
         if role == "single":
-            model = self.model_combo.currentData() or self._model
+            data = self.model_combo.currentData()
+            if isinstance(data, dict) and data.get("model"):
+                return dual_ai.RoleSpec(
+                    source=str(data.get("source") or "claude"),
+                    model=str(data.get("model")),
+                    name=str(data.get("label") or data.get("model")),
+                    effort=self._current_effort())
+            model = self._model
             if not model:
                 return dual_ai.RoleSpec(source="claude")
             return dual_ai.RoleSpec(
@@ -9957,6 +10110,7 @@ class MainWindow(QMainWindow):
                                 "请先选择主 AI 和执行 AI 的模型。")
             return
         codex_bin = dual_ai.find_codex_binary()
+        gemini_bin = dual_ai.find_gemini_binary()
         claude_bin = find_claude() or ""
         if not claude_bin and any(spec.source == "claude" for spec in active_specs):
             QMessageBox.warning(
@@ -9969,6 +10123,20 @@ class MainWindow(QMainWindow):
                 "找不到 Codex 命令行，无法调用 Codex 登录模型。\n\n"
                 "请确认 ChatGPT/Codex 桌面端已安装并完成登录。")
             return
+        if any(spec.source == "gemini" for spec in active_specs):
+            if not gemini_bin:
+                QMessageBox.warning(
+                    self, "双 AI 协作",
+                    "找不到 gemini 命令。\n\n"
+                    "请先安装：npm install -g @google/gemini-cli")
+                return
+            if not dual_ai.gemini_auth_state():
+                QMessageBox.warning(
+                    self, "Gemini 未登录",
+                    "Gemini CLI 还没有登录。\n\n"
+                    "请在终端运行 gemini，选择 Login with Google，"
+                    "或设置 GEMINI_API_KEY 后再试。")
+                return
         self._append_chat_block(
             {"kind": "user", "text": display, "plain": True})
         self.chat_input.clear()
@@ -9988,10 +10156,17 @@ class MainWindow(QMainWindow):
             permission_mode=self._current_permission_mode(),
             claude_path=claude_bin,
             codex_path=codex_bin,
+            gemini_path=gemini_bin,
             claude_env=provider_env(),
             previous_state=state.get("dual_state_dir", ""),
+            session_state=state.get("dual_session_state", []),
+            context_delta=dual_ai.history_context(
+                (state.get("blocks") or [])[state.get("dual_history_cursor", 0):-1], limit=None),
             # 发送时快照：运行中即使改动勾选也不影响本轮。
             review_enabled=self.review_check.isChecked(),
+            # 交接 token 预算（估算口径）可由环境变量配置，非法值回退默认。
+            handoff_token_budget=os.environ.get(
+                "CLAUDE_CONSOLE_HANDOFF_TOKEN_BUDGET") or None,
         )
         state["dual_thread"] = thread
         state["dual_live"] = ""
@@ -10156,6 +10331,7 @@ class MainWindow(QMainWindow):
 
     def _on_dual_completed(self, state, info):
         self._discard_dual_live(state)
+        state["dual_session_state"] = info.get("session_state", []) if not info.get("cancelled") else []
         if info.get("state_dir"):
             state["dual_state_dir"] = info["state_dir"]
         stats = info.get("stats") or {}
@@ -10165,14 +10341,26 @@ class MainWindow(QMainWindow):
         def call_text(item):
             parts = [f"{item.get('calls', 0)} 次调用"]
             cost = float(item.get("cost") or 0)
-            if cost > 0:
+            if item.get("cost_known_calls", 0) > 0:
                 parts.append(f"${cost:.4f}")
+                if item["cost_known_calls"] < item.get("calls", 0):
+                    parts.append("部分调用费用未知")
+            elif item.get("calls", 0):
+                parts.append("费用未知")
             tokens = int(item.get("tokens") or 0)
             if tokens > 0:
                 parts.append(f"{tokens:,} tokens")
             seconds = float(item.get("seconds") or 0)
             if seconds > 0:
                 parts.append(f"{seconds:.0f} 秒")
+            if item.get("calls", 0):
+                parts.append(dual_ai.usage_text(item))
+                measured = item.get("cache_measured_calls", 0)
+                if measured < item.get("calls", 0):
+                    parts.append(f"缓存数据 {measured}/{item['calls']} 次")
+                usage_coverage = item.get("usage_coverage")
+                if usage_coverage is not None and usage_coverage < 1:
+                    parts.append(f"用量数据 {usage_coverage:.0%}")
             return " · ".join(parts)
 
         takeovers = sum(
@@ -10185,6 +10373,14 @@ class MainWindow(QMainWindow):
         after = int(info.get("context_after") or before)
         context_text = (f"　上下文 {before:,}→{after:,} 字符"
                         if after < before else "")
+        switches = int(info.get("switch_count") or 0)
+        switch_text = f"　切换 {switches} 次" if switches else ""
+        handoff_tokens = int(info.get("handoff_tokens") or 0)
+        handoff_text = (f"　交接 ≈{handoff_tokens:,} tokens（估算，"
+                        f"{info.get('handoff_method') or '未知口径'}）"
+                        if handoff_tokens else "")
+        unconfirmed = len(info.get("unconfirmed_operations") or [])
+        unconfirmed_text = f"　未确认操作 {unconfirmed} 个（需先核对）" if unconfirmed else ""
 
         if info.get("cancelled"):
             note = "协作已停止。"
@@ -10195,7 +10391,8 @@ class MainWindow(QMainWindow):
             note = (
                 f"{headline} · 档次 {info.get('tier')} · "
                 f"{info.get('tier_label') or '按工作部件分工'}"
-                f"{review_text}{takeover_text}{ask_text}{context_text}\n"
+                f"{review_text}{takeover_text}{ask_text}{context_text}"
+                f"{switch_text}{handoff_text}{unconfirmed_text}\n"
                 f"主 AI：{call_text(master)}　执行 AI：{call_text(worker)}\n"
                 f"跨模型提示 {int(info.get('prompt_chars') or 0):,} 字符"
                 f"（按档次收敛调用次数与交接长度）")
@@ -10205,6 +10402,7 @@ class MainWindow(QMainWindow):
             "协作完成" if (info.get("ok") and not info.get("cancelled"))
             else "已停止" if info.get("cancelled") else "协作结束")
         state["blocks"].append({"kind": "note", "text": note})
+        state["dual_history_cursor"] = len(state["blocks"])
         if self._is_active_chat_state(state):
             self._render_chat_note(note)
             self.chat_status.setText(state["status"])
@@ -10212,6 +10410,7 @@ class MainWindow(QMainWindow):
 
     def _on_dual_failed(self, state, message):
         self._discard_dual_live(state)
+        state["dual_session_state"] = []
         text = f"协作出错：{message}"
         state["status"] = "出错"
         state["blocks"].append({"kind": "note", "text": text})
@@ -10238,28 +10437,28 @@ class MainWindow(QMainWindow):
         return self.perm_combo.currentData() or "default"
 
     def _current_model(self):
-        return self.model_combo.currentData() or self._model
+        data = self.model_combo.currentData()
+        if isinstance(data, dict):
+            return str(data.get("model") or self._model)
+        return data or self._model
 
     def _current_effort(self):
         return self.effort_combo.currentData() or self._effort
 
     # ------------------------------------------------------ 模型目录 --
-    def _populate_model_combo(self, preferred=None):
-        """用当前模型目录重建下拉框，并保持原选择（若仍存在）。"""
+    def _populate_model_combo(self, preferred=None, source=None):
+        """用统一模型目录重建单模型下拉框，并保持原选择（若仍存在）。"""
         current = preferred or self._model
-        models = list(self._model_catalog.values())
-        if not models:
-            models = [dict(m) for m in FALLBACK_MODELS]
-            self._model_catalog = {m["id"]: dict(m) for m in models}
+        current_source = source or self._model_source or "claude"
+        entries = self._single_model_entries()
 
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         selected = -1
-        for meta in models:
-            label = meta.get("name") or meta["id"]
-            self.model_combo.addItem(label, meta["id"])
+        for meta in entries:
+            self.model_combo.addItem(meta["label"], meta)
             index = self.model_combo.count() - 1
-            tips = [f"模型 ID：{meta['id']}"]
+            tips = [f"来源：{meta['source']}", f"模型 ID：{meta['model']}"]
             context = meta.get("context")
             if isinstance(context, int) and context > 0:
                 tips.append("上下文：" + (
@@ -10268,63 +10467,138 @@ class MainWindow(QMainWindow):
             efforts = meta.get("efforts") or []
             if efforts:
                 tips.append("思考档位：" + " / ".join(str(e) for e in efforts))
+            if meta["source"] == "gemini":
+                tips.append("Gemini 登录：" + (self._gemini_auth or "未登录"))
             self.model_combo.setItemData(
                 index, "\n".join(tips), Qt.ToolTipRole)
-            if meta["id"] == current:
+            if (meta["model"] == current
+                    and meta["source"] == current_source):
                 selected = index
 
-        if selected < 0:
+        if selected < 0 and current_source == "claude":
             # 保存的模型不在当前服务商的列表里，优先跟随服务商配置
             env_model = provider_env().get("ANTHROPIC_MODEL", "")
-            selected = self.model_combo.findData(env_model)
-        if selected < 0 and not self._catalog_loaded:
-            # 目录尚未取回时保留配置里的自定义模型名
-            self.model_combo.addItem(current, current)
+            for index in range(self.model_combo.count()):
+                data = self.model_combo.itemData(index) or {}
+                if (data.get("source") == "claude"
+                        and data.get("model") == env_model):
+                    selected = index
+                    break
+        present_sources = {entry["source"] for entry in entries}
+        if selected < 0 and current and (
+                (not self._catalog_loaded and current_source == "claude")
+                or (current_source in ("codex", "gemini")
+                    and current_source not in present_sources)):
+            # 目录尚未取回时保留配置里的模型名，避免启动时把来源改掉。
+            self.model_combo.addItem(
+                current, {"source": current_source, "model": current,
+                          "label": current, "efforts": []})
             selected = self.model_combo.count() - 1
         if selected < 0:
             selected = 0
         self.model_combo.setCurrentIndex(selected)
-        self._model = self.model_combo.currentData()
+        data = self.model_combo.currentData() or {}
+        self._model = str(data.get("model") or current)
+        self._model_source = str(data.get("source") or "claude")
         self.model_combo.blockSignals(False)
         self._populate_effort_combo()
 
+    def _single_model_entries(self):
+        """单模型下拉框的完整来源：Claude 服务商 + Codex + Gemini 登录模型。"""
+        entries = []
+        claude_models = list(self._model_catalog.values())
+        if not claude_models:
+            claude_models = [dict(m) for m in FALLBACK_MODELS]
+        for meta in claude_models:
+            model_id = str(meta.get("id") or "")
+            if not model_id:
+                continue
+            entries.append({
+                "source": "claude", "model": model_id,
+                "label": str(meta.get("name") or model_id),
+                "efforts": list(meta.get("efforts") or []),
+                "default_effort": meta.get("default_effort"),
+                "context": meta.get("context"),
+                "efforts_known": "efforts" in meta,
+            })
+        for meta in dual_ai.load_codex_models():
+            model_id = str(meta.get("id") or "")
+            if not model_id:
+                continue
+            entries.append({
+                "source": "codex", "model": model_id,
+                "label": "Codex · " + str(meta.get("name") or model_id),
+                "efforts": list(meta.get("efforts") or []),
+                "default_effort": meta.get("default_effort"),
+                "context": meta.get("context"),
+                "efforts_known": True,
+            })
+        for meta in dual_ai.peek_gemini_models():
+            model_id = str(meta.get("id") or "")
+            if not model_id:
+                continue
+            suffix = "" if self._gemini_auth else "（未登录）"
+            entries.append({
+                "source": "gemini", "model": model_id,
+                "label": "Gemini · " + str(meta.get("name") or model_id) + suffix,
+                "efforts": [],
+                "default_effort": "",
+                "context": meta.get("context"),
+                "efforts_known": True,
+            })
+        return entries
+
+    def _current_model_entry(self):
+        data = self.model_combo.currentData()
+        return data if isinstance(data, dict) else {}
+
     def _populate_effort_combo(self, preferred=None):
-        """按所选模型在服务商目录里报告的档位重建思考下拉框（显示英文原值）。"""
-        meta = self._model_catalog.get(self._model, {})
-        levels = [str(e) for e in (meta.get("efforts") or [])
-                  if str(e) in EFFORT_CLI_LEVELS]
-        if not levels:
-            # 服务商没有报告该模型的档位时才使用兜底
-            levels = list(FALLBACK_EFFORTS)
-        pending_effort = not self._catalog_loaded and "efforts" not in meta
-        if (pending_effort and self._effort in EFFORT_CLI_LEVELS
-                and self._effort not in levels):
-            levels.append(self._effort)
-        wanted = preferred or self._effort
-        if wanted not in levels:
-            wanted = meta.get("default_effort")
-        if wanted not in levels:
-            wanted = "high" if "high" in levels else levels[0]
+        """按所选模型报告的档位重建思考下拉框（显示英文原值）。"""
+        meta = self._current_model_entry()
+        source = str(meta.get("source") or self._model_source or "claude")
+        if source == "claude":
+            levels = [str(e) for e in (meta.get("efforts") or [])
+                      if str(e) in EFFORT_CLI_LEVELS]
+            pending_effort = not self._catalog_loaded and not meta.get("efforts_known")
+            if not levels:
+                # 服务商没有报告该模型的档位时才使用兜底
+                levels = list(FALLBACK_EFFORTS)
+            if (pending_effort and self._effort in EFFORT_CLI_LEVELS
+                    and self._effort not in levels):
+                levels.append(self._effort)
+            wanted = preferred or self._effort
+            if wanted not in levels:
+                wanted = meta.get("default_effort")
+            if wanted not in levels:
+                wanted = "high" if "high" in levels else levels[0]
+        else:
+            # Codex / Gemini 的档位来自各自 CLI；没有声明时使用模型默认值。
+            levels = [str(e) for e in (meta.get("efforts") or []) if str(e)]
+            pending_effort = False
+            wanted = preferred or self._effort
+            if wanted not in levels:
+                wanted = meta.get("default_effort") or ""
 
         self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
         for effort in levels:
             self.effort_combo.addItem(effort, effort)
+        if not levels:
+            self.effort_combo.addItem("默认", "")
         self.effort_combo.setCurrentIndex(
             max(0, self.effort_combo.findData(wanted)))
         self.effort_combo.blockSignals(False)
-        source = meta.get("source")
-        tip = f"思考档位（服务商返回 {len(levels)} 档）：" + " / ".join(levels)
-        tip += ("\n来源：" + source) if source else "\n来源：内置兜底列表"
+        tip = (f"思考档位（模型报告 {len(levels)} 档）：" + " / ".join(levels)
+               if levels else "该模型未报告可选思考档位，使用模型默认值")
         self.effort_combo.setToolTip(tip)
 
         effort = self.effort_combo.currentData()
         # 异步目录到达前，兜底选项不能覆盖已保存的自定义模型档位。
         if effort and effort != self._effort and not pending_effort:
             self._effort = effort
-            self.config["effort"] = effort
-            save_config(self.config)
-            self.worker.set_effort(effort, resume=self._chat_resume_id)
+            self._store_model_config("effort", effort)
+            if self._model_source == "claude":
+                self.worker.set_effort(effort, resume=self._chat_resume_id)
 
     def _refresh_model_catalog(self, _checked=False):
         if self._catalog_thread is not None and self._catalog_thread.isRunning():
@@ -10334,6 +10608,9 @@ class MainWindow(QMainWindow):
         self.btn_refresh_models.setText("…")
         thread = ModelCatalogWorker(self)
         thread.loaded.connect(self._on_catalog_loaded)
+        extras_loaded = getattr(thread, "extras_loaded", None)
+        if extras_loaded is not None:
+            extras_loaded.connect(self._on_extras_loaded)
         thread.finished.connect(self._on_catalog_finished)
         thread.finished.connect(thread.deleteLater)
         self._catalog_thread = thread
@@ -10344,13 +10621,25 @@ class MainWindow(QMainWindow):
         self.btn_refresh_models.setText("↻")
         self._update_dual_controls()
 
+    def _on_extras_loaded(self, extras):
+        """Gemini 登录模型目录到达后刷新两个下拉框，保持当前选择。"""
+        extras = extras if isinstance(extras, dict) else {}
+        self._gemini_auth = str(extras.get("gemini_auth") or "")
+        self._gemini_binary = str(extras.get("gemini_binary") or "")
+        self._gemini_mtime = dual_ai.gemini_settings_mtime()
+        model_before, source_before = self._model, self._model_source
+        if not self._chat_busy:
+            self._populate_model_combo(model_before, source_before)
+            self._populate_dual_combos()
+
     def _on_catalog_loaded(self, models, error):
         if self._chat_busy:
             # 正在回复时不要切换模型/思考强度，等空闲后再应用
             self._pending_catalog = (models, error)
             return
         if error or not models:
-            # Codex 目录来自本地缓存，不依赖服务商网络请求是否成功。
+            # Codex / Gemini 目录来自本地缓存或 CLI，不依赖服务商网络请求。
+            self._populate_model_combo(self._model, self._model_source)
             self._populate_dual_combos()
             self._refresh_balances()
             self.statusBar().showMessage(
@@ -10363,13 +10652,14 @@ class MainWindow(QMainWindow):
         self._populate_dual_combos()
         self._refresh_balances()
         if self._model != old_model:
-            self.config["model"] = self._model
-            save_config(self.config)
-            self.worker.set_model(self._model, resume=self._chat_resume_id)
+            self._store_model_config("model", self._model)
+            self._store_model_config("model_source", self._model_source)
+            if self._model_source == "claude":
+                self.worker.set_model(self._model, resume=self._chat_resume_id)
         if self._effort != old_effort:
-            self.config["effort"] = self._effort
-            save_config(self.config)
-            self.worker.set_effort(self._effort, resume=self._chat_resume_id)
+            self._store_model_config("effort", self._effort)
+            if self._model_source == "claude":
+                self.worker.set_effort(self._effort, resume=self._chat_resume_id)
         signature = provider_signature()
         if signature != self._provider_sig:
             # cc-switch 换服务商后，旧的 SDK 子进程仍连着原服务商
@@ -10398,32 +10688,43 @@ class MainWindow(QMainWindow):
                 popup = getattr(self, "_progress_popup", None)
                 if popup is not None and popup.isVisible():
                     popup.hide()
-            elif provider_settings_mtime() != self._settings_mtime:
+            elif (provider_settings_mtime() != self._settings_mtime
+                  or dual_ai.gemini_settings_mtime() != self._gemini_mtime):
                 QTimer.singleShot(0, self._refresh_model_catalog)
 
     def _on_model_changed(self, index):
-        model = self.model_combo.itemData(index)
+        data = self.model_combo.itemData(index)
+        if not isinstance(data, dict):
+            return
+        model = str(data.get("model") or "")
+        source = str(data.get("source") or "claude")
         if not model:
             return
         self._model = model
-        self.config["model"] = model
-        save_config(self.config)
+        self._model_source = source
+        self._store_model_config("model", model)
+        self._store_model_config("model_source", source)
         self._populate_effort_combo()
-        self.worker.set_model(model, resume=self._chat_resume_id)
-        self._sync_study_runtime(model=model)
+        if source == "claude":
+            self.worker.set_model(model, resume=self._chat_resume_id)
+        self._sync_study_runtime()
         if not self._dual_mode_on():
             self._refresh_balance("single", force=True)
+        hint = {
+            "codex": "Codex 登录模型",
+            "gemini": "Gemini 登录模型（命令行非交互执行）",
+        }.get(source, "Claude 服务商模型")
         self.statusBar().showMessage(
-            f"模型：{self.model_combo.currentText()}（已应用到对话）", 3000)
+            f"模型：{self.model_combo.currentText()} · {hint}", 3500)
 
     def _on_effort_changed(self, index):
         effort = self.effort_combo.itemData(index)
         if not effort or effort == self._effort:
             return
         self._effort = effort
-        self.config["effort"] = effort
-        save_config(self.config)
-        self.worker.set_effort(effort, resume=self._chat_resume_id)
+        self._store_model_config("effort", effort)
+        if self._model_source == "claude":
+            self.worker.set_effort(effort, resume=self._chat_resume_id)
         self._sync_study_runtime(effort=effort)
         self.statusBar().showMessage(
             f"思考强度：{effort}（已应用到对话）", 3000)
@@ -10452,9 +10753,11 @@ class MainWindow(QMainWindow):
 
     def _update_chat_buttons(self):
         has_project = bool(self.current_project)
+        cli_single = (not self._dual_mode_on()
+                      and getattr(self, "_model_source", "claude") != "claude")
         self.btn_send.setEnabled(
             has_project and not self._chat_busy
-            and (SDK_AVAILABLE or self._dual_mode_on()))
+            and (SDK_AVAILABLE or self._dual_mode_on() or cli_single))
         self.btn_stop.setEnabled(self._chat_busy)
         self.btn_new_chat.setEnabled(has_project)
         self.btn_continue_chat.setEnabled(has_project and not self._chat_busy)
@@ -10745,7 +11048,9 @@ class MainWindow(QMainWindow):
         if media_command is not None:
             self._handle_media_command(*media_command)
             return
-        if not SDK_AVAILABLE and not self.dual_check.isChecked():
+        single_spec = self._balance_spec("single")
+        if (not SDK_AVAILABLE and not self.dual_check.isChecked()
+                and single_spec.source == "claude"):
             QMessageBox.warning(
                 self, "缺少对话组件",
                 "未安装 Claude Agent SDK，无法在界面内对话。\n\n"
@@ -10763,9 +11068,9 @@ class MainWindow(QMainWindow):
             display = quote_display + display
             self._clear_quote()
         if self.btn_study_mode.isChecked():
-            if self.dual_check.isChecked():
+            if self.dual_check.isChecked() or single_spec.source != "claude":
                 self.statusBar().showMessage(
-                    "研读模式使用单模型；已按单模型流程发送", 3500)
+                    "研读模式固定使用 Claude 单模型；已按研读流程发送", 3500)
             self._send_study_learning(prompt, display)
             self._clear_attachments()
             return
@@ -10774,6 +11079,9 @@ class MainWindow(QMainWindow):
             self._send_dual_message(prompt, display)
             return
         self._study_pending = False
+        if single_spec.source != "claude":
+            self._send_single_cli_message(prompt, display, single_spec)
+            return
         self._prepare_worker()
         self._append_chat_block(
             {"kind": "user", "text": display, "plain": True})
@@ -10781,6 +11089,94 @@ class MainWindow(QMainWindow):
         self._clear_attachments()
         self._reset_live_stream()
         self.worker.send(prompt)
+
+    def _send_single_cli_message(self, prompt, display, spec):
+        """单模型模式选择 Codex / Gemini 时，用对应 CLI 在后台执行。"""
+        state = self._chat_state()
+        thread = state.get("single_cli_thread")
+        if thread is not None and thread.isRunning():
+            self.statusBar().showMessage("模型正在回复，请先停止或等待完成", 3000)
+            return
+        codex_bin = gemini_bin = ""
+        if spec.source == "codex":
+            codex_bin = dual_ai.find_codex_binary()
+            if not codex_bin:
+                QMessageBox.warning(
+                    self, "Codex 登录模型",
+                    "找不到 Codex 命令行。\n\n"
+                    "请确认 ChatGPT/Codex 桌面端已安装并完成登录。")
+                return
+        elif spec.source == "gemini":
+            gemini_bin = dual_ai.find_gemini_binary()
+            if not gemini_bin:
+                QMessageBox.warning(
+                    self, "Gemini 登录模型",
+                    "找不到 gemini 命令。\n\n"
+                    "请先安装 Gemini CLI：\n"
+                    "npm install -g @google/gemini-cli\n\n"
+                    "然后在终端运行 gemini，选择 Google 账号登录。")
+                return
+            if not dual_ai.gemini_auth_state():
+                QMessageBox.warning(
+                    self, "Gemini 未登录",
+                    "Gemini CLI 已安装，但还没有登录。\n\n"
+                    "请在终端运行：gemini\n"
+                    "选择 Login with Google（或设置 GEMINI_API_KEY），"
+                    "完成后再选择 Gemini 模型。")
+                return
+        self._append_chat_block(
+            {"kind": "user", "text": display, "plain": True})
+        self.chat_input.clear()
+        self._clear_attachments()
+        self._reset_live_stream()
+        if (self._current_permission_mode() == "default"
+                and not state.get("cli_perm_noted")):
+            state["cli_perm_noted"] = True
+            note = ("提示：Codex / Gemini 使用命令行非交互模式，"
+                    "「请求批准」会按“自动批准文件编辑”执行；"
+                    "需要完全放开时请选择「完全访问」。")
+            state["blocks"].append({"kind": "note", "text": note})
+            if self._is_active_chat_state(state):
+                self._render_chat_note(note)
+        sessions = state.setdefault("cli_sessions", {})
+        session_id = str(sessions.get(spec.source) or "")
+        if not session_id:
+            # 首次由该 CLI 接手时补上此前的对话上下文，避免切换模型后失忆。
+            history = dual_ai.history_context(
+                (state.get("blocks") or [])[:-1], limit=7000)
+            if history:
+                prompt = history + "\n\n" + prompt
+        thread = dual_ai.SingleCliThread(
+            parent=self,
+            cwd=self.current_project,
+            request=prompt,
+            spec=spec,
+            permission_mode=self._current_permission_mode(),
+            claude_path=find_claude() or "",
+            codex_path=codex_bin,
+            gemini_path=gemini_bin,
+            env=provider_env(),
+            session_id=session_id)
+        state["single_cli_thread"] = thread
+        state["busy"] = True
+        self._chat_busy = True
+        self._update_chat_buttons()
+        self.chat_status.setText(f"{spec.label} 正在回复…")
+        thread.delta.connect(
+            lambda chunk, s=state: self._on_chat_delta(s, chunk))
+        thread.message.connect(
+            lambda text, tools, s=state: self._on_chat_assistant(s, text, tools))
+        thread.tool.connect(
+            lambda name, data, s=state: self._on_chat_tool(s, name, data))
+        thread.result.connect(
+            lambda info, s=state: self._on_single_cli_result(s, info))
+        thread.error.connect(
+            lambda message, s=state: self._on_chat_error(s, message))
+        thread.busy_changed.connect(
+            lambda busy, s=state: self._on_chat_busy(s, busy))
+        thread.finished.connect(
+            lambda s=state: self._on_single_cli_finished(s))
+        thread.start()
 
     def _reset_live_stream(self):
         self._chat_state()["live"] = ""
@@ -12051,6 +12447,9 @@ class MainWindow(QMainWindow):
         perm = (self._current_permission_mode()
                 if permission is None else permission)
         mdl = self._current_model() if model is None else model
+        if model is None and self._model_source != "claude":
+            # 研读 / 开发页固定使用 Claude SDK，不能把 Codex/Gemini 模型名传过去。
+            mdl = default_model_choice()
         eff = self._current_effort() if effort is None else effort
         for page in self._study_pages.values():
             page.set_runtime(perm, mdl, eff)
@@ -12484,6 +12883,31 @@ class MainWindow(QMainWindow):
         if active:
             self._scroll_to_bottom()
 
+    def _on_chat_tool(self, state, name, data):
+        block = {"kind": "tool", "name": name, "data": data or {}}
+        state["blocks"].append(block)
+        if self._is_active_chat_state(state):
+            self._render_tool_chip(name, data or {})
+
+    def _on_single_cli_result(self, state, info):
+        sid = info.get("session_id")
+        source = str(info.get("source") or self._model_source)
+        if sid:
+            state.setdefault("cli_sessions", {})[source] = str(sid)
+        self._on_chat_result(state, info)
+
+    def _on_single_cli_finished(self, state):
+        thread = state.get("single_cli_thread")
+        if thread is not None:
+            thread.deleteLater()
+            state["single_cli_thread"] = None
+        state["busy"] = False
+        self._chat_busy = False
+        if self._is_active_chat_state(state):
+            self._stream_timer.stop()
+            self._update_chat_buttons()
+            self._flush_stream()
+
     def _on_chat_result(self, state, info):
         active = self._is_active_chat_state(state)
         if active:
@@ -12514,9 +12938,19 @@ class MainWindow(QMainWindow):
             state["status"] = label
         if active:
             self.chat_status.setText(state["status"])
+        if "metrics" in info:
+            state["last_usage"] = info
+            detail = dual_ai.usage_text(info["metrics"])
+            if info.get("cost") is None:
+                detail += " · 费用未知"
+            state["blocks"].append({"kind": "note", "text": detail})
+            if active:
+                self._render_chat_note(detail)
         state["study_pending"] = False
         sid = info.get("session_id")
-        if sid:
+        # Codex / Gemini 的会话 ID 只用于各自 CLI 续接，不能写进 Claude SDK 的
+        # resume，否则切回 Claude 时会把无效会话传给 SDK。
+        if sid and info.get("source") not in ("codex", "gemini"):
             state["session_id"] = sid
             state["resume_id"] = sid
             state["needs_reconfigure"] = False
@@ -12546,11 +12980,13 @@ class MainWindow(QMainWindow):
             return
         self._update_chat_buttons()
         if busy:
-            self.chat_status.setText("Claude 正在回复…")
+            if not self.chat_status.text().endswith("正在回复…"):
+                self.chat_status.setText("正在回复…")
         else:
             self._flush_stream()
             self._stream_timer.stop()
-            if self.chat_status.text().startswith("Claude 正在回复"):
+            if (self.chat_status.text().startswith("Claude 正在回复")
+                    or self.chat_status.text().endswith("正在回复…")):
                 self.chat_status.setText(state["status"] or "就绪")
             if self._pending_catalog is not None:
                 models, error = self._pending_catalog
@@ -12576,6 +13012,11 @@ class MainWindow(QMainWindow):
             thread.cancel()
             self.chat_status.setText("正在停止协作…")
             return
+        cli_thread = state.get("single_cli_thread")
+        if cli_thread is not None and cli_thread.isRunning():
+            cli_thread.cancel()
+            self.chat_status.setText("正在停止…")
+            return
         if self._chat_busy:
             self.worker.interrupt()
             self.chat_status.setText("正在停止…")
@@ -12590,6 +13031,12 @@ class MainWindow(QMainWindow):
             thread.cancel()
             self.chat_status.setText("正在停止协作，请结束后再新建对话…")
             return
+        cli_thread = state.get("single_cli_thread")
+        if cli_thread is not None and cli_thread.isRunning():
+            cli_thread.cancel()
+            self.chat_status.setText("正在停止，请结束后再新建对话…")
+            return
+        state["cli_sessions"] = {}
         if state.get("worker") is not None:
             state["worker"].reset()
         state["blocks"] = []
@@ -12600,6 +13047,11 @@ class MainWindow(QMainWindow):
         state["dual_last_role"] = ""
         state["status"] = "新对话"
         state.pop("dual_state_dir", None)
+        state["dual_session_state"] = []
+        state["dual_history_cursor"] = 0
+        state["model_config_override"] = None
+        # 每个新对话默认勾选“仅本次对话”。
+        state["model_config_scoped"] = True
         self._chat_cwd = None
         self._chat_resume_id = None
         self._chat_session_id = None
@@ -12619,6 +13071,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(0)
         self.chat_input.setFocus()
         self._update_chat_buttons()
+        self._restore_model_config_for_chat()
 
     def _continue_last_chat(self):
         if not self.current_project:
@@ -12662,6 +13115,11 @@ class MainWindow(QMainWindow):
         state["live"] = ""
         state["status"] = "已恢复会话"
         state.pop("dual_state_dir", None)
+        state["dual_session_state"] = []
+        state["dual_history_cursor"] = 0
+        state["model_config_override"] = None
+        # 恢复会话同样作为一个新的对话上下文，默认勾选“仅本次对话”。
+        state["model_config_scoped"] = True
         self._chat_cwd = None
         self._chat_resume_id = sid
         self._chat_session_id = sid
@@ -12680,6 +13138,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(0)
         self.chat_input.setFocus()
         self._update_chat_buttons()
+        self._restore_model_config_for_chat()
 
     def _reset_chat_for_project(self):
         """切换项目：只换显示，不打断别的项目仍在运行的会话。"""
@@ -12693,6 +13152,7 @@ class MainWindow(QMainWindow):
             self._update_chat_buttons()
             return
         state = self._chat_state()
+        self._restore_model_config_for_chat()
         self._render_chat_state()
         thread = state.get("dual_thread")
         dual_busy = thread is not None and thread.isRunning()

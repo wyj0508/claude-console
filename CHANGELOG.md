@@ -1,5 +1,22 @@
 # 更新日志
 
+## 2.1 — 2026-11-24
+
+### 新增
+
+- **Gemini 登录模型**：检测本机 Gemini CLI（`@google/gemini-cli`），读取
+  `gemini --list-models` 的模型列表；单 AI 和双 AI 的模型下拉框都可选择。
+  调用通过 `gemini -p --output-format stream-json` 非交互执行，并支持会话续接。
+- **单 AI 模式可选全部模型**：单 AI 下拉框统一列出 Claude 服务商、Codex
+  登录模型和 Gemini 登录模型；选择 Codex / Gemini 时自动走对应 CLI，
+  选择 Claude 时仍使用原来的 Agent SDK。
+
+### 说明
+
+- Gemini 需要先在终端运行一次 `gemini` 并选择 Google 账号登录，
+  或在环境变量 / `~/.gemini/.env` 中设置 `GEMINI_API_KEY`。
+- 研读页和代码开发页固定使用 Claude SDK，不受单 AI 的非 Claude 选择影响。
+
 ## 2.0 — 2026-11-23
 
 双 AI 协作版本。在 1.0 的单 AI 基础上加入主 AI / 执行 AI 分工，并修复协作
